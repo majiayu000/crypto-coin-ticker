@@ -1,0 +1,40 @@
+[package]
+name = "okk"
+version = "0.1.0"
+edition = "2021"
+
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.75"
+console-subscriber = "0.1.10"
+exc = { version = "=0.6.0-beta.1", features = ["okx", "binance"]  }
+exc-binance = "=0.6.0-beta.1"
+exc-core = "=0.6.0-beta.1"
+exc-okx = "=0.6.0-beta.1"
+tokio = { version = "1.32.0", features = ["full", "tracing"] }
+tracing = "0.1.37"
+tracing-subscriber = { version = "0.3.3", features = ["env-filter", "json"] }
+futures = "0.3.28"
+
+time = "*"
+
+rust_decimal = "*"
+rust_decimal_macros = "*"
+clap = "*"
+serde = "1.0.188"
+serde_json = "1.0.105"
+humantime = "*"
+
+
+tower = "0.4.13"
+
+
+
+toml = "0.5.9"
+
+image = "0.24.7"
+tao = "0.22.2"
+tray-icon = "0.8.3"
+chrono = "0.4.27"
