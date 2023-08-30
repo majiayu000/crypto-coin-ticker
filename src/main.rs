@@ -86,14 +86,8 @@ let handles = ["BTC-USDT"]
 
     let quit_i = MenuItem::new("Quit", true, None);
     tray_menu.append_items(&[
-        &PredefinedMenuItem::about(
-            None,
-            Some(AboutMetadata {
-                name: Some("tao".to_string()),
-                copyright: Some("Copyright tao".to_string()),
-                ..Default::default()
-            }),
-        ),
+
+
         &PredefinedMenuItem::separator(),
         &quit_i,
     ]);
