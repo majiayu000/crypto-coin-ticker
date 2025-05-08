@@ -13,7 +13,7 @@ exc = { version = "=0.6.0-beta.1", features = ["okx", "binance"]  }
 exc-binance = "=0.6.0-beta.1"
 exc-core = "=0.6.0-beta.1"
 exc-okx = "=0.6.0-beta.1"
-tokio = { version = "1.32.0", features = ["full", "tracing"] }
+tokio = { version = "1.38.2", features = ["full", "tracing"] }
 tracing = "0.1.37"
 tracing-subscriber = { version = "0.3.3", features = ["env-filter", "json"] }
 futures = "0.3.28"
