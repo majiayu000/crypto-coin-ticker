@@ -1,0 +1,34 @@
+# Crypto Ticker Configuration Example
+# Copy this file to config.toml and modify as needed
+
+# Trading pairs to monitor (can add multiple)
+trading_pairs = ["BTC-USDT", "ETH-USDT", "SOL-USDT"]
+
+# Update interval in seconds
+update_interval_secs = 1
+
+# WebSocket connection timeout in seconds
+ws_connection_timeout_secs = 2
+
+# WebSocket ping timeout in seconds
+ws_ping_timeout_secs = 5
+
+# Icon path (relative to project root or absolute path)
+icon_path = "icons/icon.png"
+
+# Tray tooltip text
+tooltip = "Crypto Ticker - Real-time price updates"
+
+# Performance settings
+# Maximum number of price updates to buffer in memory (default: 1000)
+max_buffer_size = 1000
+
+# Enable debug logging (impacts performance, default: false)
+debug_logging = false
+
+# Performance settings
+# Maximum number of price updates to buffer in memory (default: 1000)
+max_buffer_size = 1000
+
+# Enable debug logging (impacts performance, default: false)
+debug_logging = false
