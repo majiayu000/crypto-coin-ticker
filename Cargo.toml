@@ -2,6 +2,7 @@
 name = "okk"
 version = "0.2.0"
 edition = "2024"
+license = "MIT"
 
 # Performance optimizations
 [profile.release]
