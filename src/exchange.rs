@@ -18,11 +18,12 @@
 //! ## Usage
 //! ```rust
 //! use okk::{Config, ExchangeClient};
+//! use okk::exchange::PriceUpdate;
 //! use std::sync::mpsc::channel;
 //!
 //! let config = Config::default();
 //! let client = ExchangeClient::new(config);
-//! let (tx, rx) = channel();
+//! let (tx, rx) = channel::<PriceUpdate>();
 //! // let handles = client.start_price_monitoring(tx).await?;
 //! ```
 

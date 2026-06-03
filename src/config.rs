@@ -18,17 +18,21 @@
 //! - WebSocket connection parameters
 //!
 //! ## Usage
-//! ```rust
-//! use okk::Config;
+//! ```rust,no_run
+//! use okk::{Config, Result};
 //!
-//! // Load from file
-//! let config = Config::from_file("config.toml")?;
+//! fn main() -> Result<()> {
+//!     // Load from file
+//!     let config = Config::from_file("config.toml")?;
 //!
-//! // Use defaults
-//! let config = Config::default();
+//!     // Use defaults
+//!     let config = Config::default();
 //!
-//! // Save to file
-//! config.save_to_file("config.toml")?;
+//!     // Save to file
+//!     config.save_to_file("config.toml")?;
+//!
+//!     Ok(())
+//! }
 //! ```
 
 use serde::{Deserialize, Serialize};

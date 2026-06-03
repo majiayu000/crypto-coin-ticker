@@ -12,7 +12,7 @@
 //! - **Low Resource Usage**: Minimal CPU and memory footprint
 //!
 //! ## Quick Start
-//! ```rust
+//! ```rust,no_run
 //! use okk::{Config, ExchangeClient, TrayUI};
 //! use std::sync::mpsc::channel;
 //!
