@@ -25,10 +25,3 @@ max_buffer_size = 1000
 
 # Enable debug logging (impacts performance, default: false)
 debug_logging = false
-
-# Performance settings
-# Maximum number of price updates to buffer in memory (default: 1000)
-max_buffer_size = 1000
-
-# Enable debug logging (impacts performance, default: false)
-debug_logging = false
