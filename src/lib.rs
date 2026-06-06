@@ -12,14 +12,14 @@
 //! - **Low Resource Usage**: Minimal CPU and memory footprint
 //!
 //! ## Quick Start
-//! ```rust
+//! ```rust,no_run
 //! use okk::{Config, ExchangeClient, TrayUI};
-//! use std::sync::mpsc::channel;
+//! use std::sync::mpsc::sync_channel;
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
 //!     let config = Config::default();
-//!     let (tx, rx) = channel();
+//!     let (tx, rx) = sync_channel(config.max_buffer_size);
 //!
 //!     let exchange_client = ExchangeClient::new(config.clone());
 //!     let _handles = exchange_client.start_price_monitoring(tx).await?;

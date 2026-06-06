@@ -20,15 +20,15 @@
 //! // tray_ui.run(price_receiver)?;
 //! ```
 
-use std::sync::mpsc::Receiver;
-use tao::event_loop::{ControlFlow, EventLoopBuilder};
-use tray_icon::{
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
-    TrayIconBuilder, TrayIconEvent,
-};
 use crate::config::Config;
 use crate::error::{Result, TickerError};
 use crate::exchange::PriceUpdate;
+use std::sync::mpsc::Receiver;
+use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tray_icon::{
+    TrayIconBuilder, TrayIconEvent,
+    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+};
 
 /// Tray UI manager for displaying cryptocurrency prices in the system tray
 pub struct TrayUI {
@@ -45,11 +45,10 @@ impl TrayUI {
     pub fn run(self, price_rx: Receiver<PriceUpdate>) -> Result<()> {
         tracing::info!("Initializing system tray UI");
 
-        let icon = self.load_icon()
-            .map_err(|e| {
-                tracing::error!("Failed to load tray icon: {}", e);
-                e
-            })?;
+        let icon = self.load_icon().map_err(|e| {
+            tracing::error!("Failed to load tray icon: {}", e);
+            e
+        })?;
 
         let event_loop = EventLoopBuilder::new().build();
 
@@ -57,10 +56,9 @@ impl TrayUI {
         let tray_menu = Menu::new();
         let quit_item = MenuItem::new("Quit", true, None);
 
-        tray_menu.append_items(&[
-            &PredefinedMenuItem::separator(),
-            &quit_item,
-        ]).map_err(|e| TickerError::UIError(format!("Failed to create menu items: {}", e)))?;
+        tray_menu
+            .append_items(&[&PredefinedMenuItem::separator(), &quit_item])
+            .map_err(|e| TickerError::UIError(format!("Failed to create menu items: {}", e)))?;
 
         // Create tray icon with detailed error context
         let mut tray_icon = Some(
@@ -101,7 +99,7 @@ impl TrayUI {
                     // Use more efficient string formatting to reduce allocations
                     let title = format!("{}: ${:.2}", price_update.pair, price_update.price);
                     if let Some(ref mut tray) = tray_icon {
-                        let _ = tray.set_title(Some(&title));
+                        tray.set_title(Some(&title));
                     }
 
                     tracing::debug!("Updated tray with: {}", title);
@@ -112,7 +110,7 @@ impl TrayUI {
                         if connection_status != "Disconnected" {
                             connection_status = "Disconnected";
                             if let Some(ref mut tray) = tray_icon {
-                                let _ = tray.set_title(Some("Disconnected"));
+                                tray.set_title(Some("Disconnected"));
                             }
                             tracing::warn!("No price updates received for 30 seconds");
                         }
@@ -148,7 +146,7 @@ impl TrayUI {
     fn load_icon(&self) -> Result<tray_icon::Icon> {
         let icon_path = self.config.get_icon_path();
         let path = std::path::Path::new(&icon_path);
-        
+
         let (icon_rgba, icon_width, icon_height) = {
             let image = image::open(path)
                 .map_err(|e| TickerError::UIError(format!("Failed to open icon: {}", e)))?
@@ -161,6 +159,4 @@ impl TrayUI {
         tray_icon::Icon::from_rgba(icon_rgba, icon_width, icon_height)
             .map_err(|e| TickerError::UIError(format!("Failed to create icon: {}", e)))
     }
-
-
 }

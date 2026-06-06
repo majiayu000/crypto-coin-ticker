@@ -23,10 +23,9 @@
 //! RUST_LOG=exc_okx=debug,okx_streams=debug cargo run
 //! ```
 
-use std::sync::mpsc::channel;
-use tracing_subscriber::prelude::*;
 use okk::{Config, ExchangeClient, TrayUI};
-
+use std::sync::mpsc::sync_channel;
+use tracing_subscriber::prelude::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -39,24 +38,10 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry().with(fmt).init();
 
     // Load configuration
-    let config = if std::path::Path::new("config.toml").exists() {
-        match Config::from_file("config.toml") {
-            Ok(config) => {
-                tracing::info!("Loaded configuration from config.toml");
-                config
-            }
-            Err(e) => {
-                tracing::warn!("Failed to load config.toml: {}, using defaults", e);
-                Config::default()
-            }
-        }
-    } else {
-        tracing::info!("No config.toml found, using default configuration");
-        Config::default()
-    };
+    let config = Config::from_optional_file("config.toml")?;
 
-    // Create communication channel
-    let (tx, rx) = channel();
+    // Create bounded communication channel
+    let (tx, rx) = sync_channel(config.max_buffer_size);
 
     // Start exchange client
     let exchange_client = ExchangeClient::new(config.clone());

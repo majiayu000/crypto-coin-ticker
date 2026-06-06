@@ -55,6 +55,16 @@ debug_logging = false
 
 See `config.toml.example` for all available options.
 
+## Release Status
+
+This project is currently source-only. Build and run it from a local checkout until a tagged GitHub release or package artifact is published.
+
+## Limitations
+
+- Prices are displayed from exchange streaming APIs and can be delayed, interrupted, or unavailable.
+- The app is a monitoring tool only and is not financial advice or a trading signal.
+- Always verify price data with your exchange before making financial decisions.
+
 ## Supported Exchanges
 
 - **OKX**: Primary exchange with full WebSocket streaming support
