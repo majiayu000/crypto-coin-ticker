@@ -20,7 +20,7 @@
 //! Set the `RUST_LOG` environment variable to control logging levels:
 //! ```bash
 //! RUST_LOG=debug cargo run
-//! RUST_LOG=exc_okx=debug,okx_streams=debug cargo run
+//! RUST_LOG=okk=debug cargo run
 //! ```
 
 use okk::{Config, ExchangeClient, TrayUI};
@@ -33,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
     let fmt = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
         .with_filter(tracing_subscriber::EnvFilter::new(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "exc_okx=debug,okx_streams=debug".into()),
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "okk=info".into()),
         ));
     tracing_subscriber::registry().with(fmt).init();
 
