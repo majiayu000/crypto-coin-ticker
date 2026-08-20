@@ -29,6 +29,7 @@
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
@@ -63,174 +64,58 @@ impl ExchangeClient {
             self.config.trading_pairs.len()
         );
 
-        // Pre-allocate vector with known capacity to avoid reallocations
-        let mut handles = Vec::with_capacity(self.config.trading_pairs.len());
-
-        for pair in &self.config.trading_pairs {
-            let tx = tx.clone();
-            let pair = pair.clone(); // Clone only once per iteration
-            let update_interval = Duration::from_secs(self.config.update_interval_secs);
-            let connection_timeout = Duration::from_secs(self.config.ws_connection_timeout_secs);
-            let ping_timeout = Duration::from_secs(self.config.ws_ping_timeout_secs.max(1));
-
-            let handle = tokio::spawn(async move {
-                Self::monitor_pair(tx, pair, update_interval, connection_timeout, ping_timeout)
-                    .await;
-            });
-
-            handles.push(handle);
+        if self.config.trading_pairs.is_empty() {
+            return Ok(Vec::new());
         }
 
-        tracing::info!("Started {} monitoring tasks", handles.len());
-        Ok(handles)
+        let pairs = self.config.trading_pairs.clone();
+        let update_interval = Duration::from_secs(self.config.update_interval_secs);
+        let connection_timeout = Duration::from_secs(self.config.ws_connection_timeout_secs.max(1));
+        let pong_timeout = Duration::from_secs(self.config.ws_ping_timeout_secs.max(1));
+        let handle = tokio::spawn(async move {
+            Self::monitor_pairs(tx, pairs, update_interval, connection_timeout, pong_timeout).await;
+        });
+
+        tracing::info!("Started one shared OKX monitoring task");
+        Ok(vec![handle])
     }
 
-    /// Monitor a single trading pair with automatic reconnection and error recovery
-    async fn monitor_pair(
+    /// Monitor all configured pairs over one OKX connection.
+    async fn monitor_pairs(
         tx: SyncSender<PriceUpdate>,
-        pair: String,
+        pairs: Vec<String>,
         update_interval: Duration,
         connection_timeout: Duration,
-        ping_timeout: Duration,
+        pong_timeout: Duration,
     ) {
-        let mut consecutive_errors = 0;
-        let mut last_sent_at = None;
-        const MAX_CONSECUTIVE_ERRORS: u32 = 5;
+        let mut consecutive_errors = 0_u32;
+        let mut last_sent_at = HashMap::<String, Instant>::new();
         const BASE_BACKOFF_SECS: u64 = 1;
 
         loop {
-            tracing::info!("Starting monitoring for {}", pair);
+            tracing::info!("Connecting to OKX for {} pairs", pairs.len());
+            let result = Self::run_connection(
+                &tx,
+                &pairs,
+                &mut last_sent_at,
+                &mut consecutive_errors,
+                update_interval,
+                connection_timeout,
+                pong_timeout,
+            )
+            .await;
 
-            match tokio::time::timeout(connection_timeout, connect_async(OKX_PUBLIC_WS_URL)).await {
-                Ok(Ok((stream, _response))) => {
-                    consecutive_errors = 0; // Reset error counter on successful connection
-                    tracing::info!("Successfully connected to {} stream", pair);
-
-                    let (mut write, mut read) = stream.split();
-                    let subscribe_request = match build_okx_subscribe_request(&pair) {
-                        Ok(request) => request,
-                        Err(err) => {
-                            tracing::error!(
-                                "Failed to build OKX subscription for {}: {}",
-                                pair,
-                                err
-                            );
-                            return;
-                        }
-                    };
-
-                    if let Err(err) = write.send(Message::Text(subscribe_request.into())).await {
-                        consecutive_errors += 1;
-                        tracing::warn!("Failed to subscribe to {}: {}", pair, err);
-                    } else {
-                        tracing::info!("Subscribed to OKX ticker stream for {}", pair);
-                        let mut ping_interval = tokio::time::interval(ping_timeout);
-
-                        loop {
-                            tokio::select! {
-                                _ = ping_interval.tick() => {
-                                    if let Err(err) = write.send(Message::Text(OKX_PING.into())).await {
-                                        tracing::warn!("Failed to send OKX ping for {}: {}", pair, err);
-                                        break;
-                                    }
-                                }
-                                result = read.next() => {
-                                    match result {
-                                        Some(Ok(message)) => {
-                                            match message {
-                                                Message::Text(raw) => {
-                                                    let raw = raw.to_string();
-                                                    match parse_okx_ticker_updates(&raw) {
-                                                        Ok(updates) => {
-                                                            for ticker in updates {
-                                                                let now = Instant::now();
-                                                                if !should_emit_update(last_sent_at, now, update_interval) {
-                                                                    continue;
-                                                                }
-
-                                                                tracing::debug!("{}: {}", ticker.pair, ticker.last);
-
-                                                                match tx.try_send(PriceUpdate::new(ticker.pair, ticker.last)) {
-                                                                    Ok(()) => {
-                                                                        last_sent_at = Some(now);
-                                                                    }
-                                                                    Err(TrySendError::Full(_)) => {
-                                                                        tracing::warn!(
-                                                                            "Price update buffer full for {}, dropping stale update",
-                                                                            pair
-                                                                        );
-                                                                    }
-                                                                    Err(TrySendError::Disconnected(_)) => {
-                                                                        tracing::error!(
-                                                                            "Channel closed, stopping monitoring for {}",
-                                                                            pair
-                                                                        );
-                                                                        return; // Exit if channel is closed
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                        Err(err) => {
-                                                            tracing::warn!("Failed to parse OKX ticker message for {}: {}", pair, err);
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-                                                Message::Ping(payload) => {
-                                                    if let Err(err) = write.send(Message::Pong(payload)).await {
-                                                        tracing::warn!("Failed to answer OKX ping for {}: {}", pair, err);
-                                                        break;
-                                                    }
-                                                }
-                                                Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {}
-                                                Message::Close(frame) => {
-                                                    tracing::warn!("OKX stream for {} closed: {:?}", pair, frame);
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        Some(Err(err)) => {
-                                            tracing::warn!("Stream error for {}: {}", pair, err);
-                                            break; // Break inner loop to reconnect
-                                        }
-                                        None => {
-                                            tracing::warn!("Stream for {} ended, attempting reconnection...", pair);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(Err(err)) => {
-                    consecutive_errors += 1;
-                    tracing::error!(
-                        "Failed to connect to OKX for {} (attempt {}/{}): {}",
-                        pair,
-                        consecutive_errors,
-                        MAX_CONSECUTIVE_ERRORS,
-                        err
-                    );
-                }
-                Err(_elapsed) => {
-                    consecutive_errors += 1;
-                    tracing::error!(
-                        "Timed out connecting to OKX for {} (attempt {}/{})",
-                        pair,
-                        consecutive_errors,
-                        MAX_CONSECUTIVE_ERRORS
-                    );
-                }
+            if matches!(result, Err(TickerError::ChannelError(_))) {
+                tracing::error!("Price update channel closed; stopping OKX monitoring");
+                return;
             }
-
-            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                tracing::error!(
-                    "Max consecutive errors reached for {}, backing off longer",
-                    pair
+            if let Err(err) = result {
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                tracing::warn!(
+                    "OKX connection attempt {} failed: {}",
+                    consecutive_errors,
+                    err
                 );
-                tokio::time::sleep(Duration::from_secs(BASE_BACKOFF_SECS * 10)).await;
-                consecutive_errors = 0; // Reset after long backoff
             }
 
             // Exponential backoff with simple jitter
@@ -240,11 +125,135 @@ impl ExchangeClient {
             let sleep_duration = Duration::from_secs(backoff_secs + jitter);
 
             tracing::info!(
-                "Waiting {:?} before reconnecting to {}",
+                "Waiting {:?} before reconnecting to OKX",
                 sleep_duration,
-                pair
             );
             tokio::time::sleep(sleep_duration).await;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_connection(
+        tx: &SyncSender<PriceUpdate>,
+        pairs: &[String],
+        last_sent_at: &mut HashMap<String, Instant>,
+        consecutive_errors: &mut u32,
+        update_interval: Duration,
+        connection_timeout: Duration,
+        pong_timeout: Duration,
+    ) -> Result<()> {
+        let (stream, _response) = tokio::time::timeout(
+            connection_timeout,
+            connect_async(OKX_PUBLIC_WS_URL),
+        )
+        .await
+        .map_err(|_| TickerError::NetworkError("Timed out connecting to OKX".to_string()))?
+        .map_err(|err| TickerError::NetworkError(format!("Failed to connect to OKX: {err}")))?;
+        let (mut write, mut read) = stream.split();
+
+        let subscribe_request = build_okx_subscribe_request(pairs)?;
+        write
+            .send(Message::Text(subscribe_request.into()))
+            .await
+            .map_err(|err| TickerError::NetworkError(format!("Failed to subscribe: {err}")))?;
+
+        let mut pending: HashSet<String> = pairs.iter().cloned().collect();
+        tokio::time::timeout(connection_timeout, async {
+            while !pending.is_empty() {
+                match read.next().await {
+                    Some(Ok(Message::Text(raw))) => {
+                        if raw == OKX_PONG {
+                            continue;
+                        }
+                        if let Some(pair) = parse_okx_subscription_ack(&raw)? {
+                            if !pending.remove(&pair) {
+                                return Err(TickerError::ExchangeError(format!(
+                                    "Unexpected OKX subscription acknowledgement for {pair}"
+                                )));
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(payload))) => write
+                        .send(Message::Pong(payload))
+                        .await
+                        .map_err(|err| TickerError::NetworkError(err.to_string()))?,
+                    Some(Ok(Message::Close(frame))) => {
+                        return Err(TickerError::NetworkError(format!(
+                            "OKX closed before subscription confirmation: {frame:?}"
+                        )));
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(err)) => return Err(TickerError::NetworkError(err.to_string())),
+                    None => {
+                        return Err(TickerError::NetworkError(
+                            "OKX ended before subscription confirmation".to_string(),
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| {
+            TickerError::NetworkError("Timed out waiting for OKX subscription confirmation".to_string())
+        })??;
+
+        tracing::info!("OKX confirmed {} ticker subscriptions", pairs.len());
+        let mut ping_interval = tokio::time::interval(pong_timeout);
+        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut awaiting_pong_since: Option<Instant> = None;
+
+        loop {
+            tokio::select! {
+                _ = ping_interval.tick() => {
+                    if awaiting_pong_since.is_some_and(|sent| sent.elapsed() >= pong_timeout) {
+                        return Err(TickerError::NetworkError("OKX pong deadline exceeded".to_string()));
+                    }
+                    if awaiting_pong_since.is_none() {
+                        write.send(Message::Text(OKX_PING.into())).await
+                            .map_err(|err| TickerError::NetworkError(format!("Failed to ping OKX: {err}")))?;
+                        awaiting_pong_since = Some(Instant::now());
+                    }
+                }
+                result = read.next() => match result {
+                    Some(Ok(Message::Text(raw))) => {
+                        if raw == OKX_PONG {
+                            awaiting_pong_since = None;
+                            continue;
+                        }
+                        let updates = parse_okx_ticker_updates(&raw)?;
+                        if !updates.is_empty() {
+                            *consecutive_errors = 0;
+                        }
+                        for ticker in updates {
+                            let now = Instant::now();
+                            if !should_emit_update(last_sent_at.get(&ticker.pair).copied(), now, update_interval) {
+                                continue;
+                            }
+                            let pair = ticker.pair.clone();
+                            match tx.try_send(PriceUpdate::new(ticker.pair, ticker.last)) {
+                                Ok(()) => {
+                                    last_sent_at.insert(pair, now);
+                                }
+                                Err(TrySendError::Full(_)) => tracing::warn!(
+                                    "Price update buffer full for {pair}, dropping stale update"
+                                ),
+                                Err(TrySendError::Disconnected(_)) => return Err(
+                                    TickerError::ChannelError("Price update receiver closed".to_string())
+                                ),
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(payload))) => write.send(Message::Pong(payload)).await
+                        .map_err(|err| TickerError::NetworkError(err.to_string()))?,
+                    Some(Ok(Message::Close(frame))) => return Err(TickerError::NetworkError(
+                        format!("OKX stream closed: {frame:?}")
+                    )),
+                    Some(Ok(Message::Pong(_) | Message::Binary(_) | Message::Frame(_))) => {}
+                    Some(Err(err)) => return Err(TickerError::NetworkError(err.to_string())),
+                    None => return Err(TickerError::NetworkError("OKX stream ended".to_string())),
+                }
+            }
         }
     }
 }
@@ -252,7 +261,7 @@ impl ExchangeClient {
 #[derive(Debug, Serialize)]
 struct OkxSubscribeRequest<'a> {
     op: &'static str,
-    args: [OkxSubscribeArg<'a>; 1],
+    args: Vec<OkxSubscribeArg<'a>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -267,7 +276,15 @@ struct OkxTickerPayload {
     event: Option<String>,
     code: Option<String>,
     msg: Option<String>,
+    arg: Option<OkxResponseArg>,
     data: Option<Vec<OkxTickerData>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OkxResponseArg {
+    channel: String,
+    #[serde(rename = "instId")]
+    inst_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -283,18 +300,50 @@ struct OkxTicker {
     last: Price,
 }
 
-fn build_okx_subscribe_request(pair: &str) -> Result<String> {
+fn build_okx_subscribe_request(pairs: &[String]) -> Result<String> {
     let request = OkxSubscribeRequest {
         op: "subscribe",
-        args: [OkxSubscribeArg {
-            channel: OKX_TICKERS_CHANNEL,
-            inst_id: pair,
-        }],
+        args: pairs
+            .iter()
+            .map(|pair| OkxSubscribeArg {
+                channel: OKX_TICKERS_CHANNEL,
+                inst_id: pair,
+            })
+            .collect(),
     };
 
     serde_json::to_string(&request).map_err(|e| {
         TickerError::ExchangeError(format!("Failed to serialize OKX subscription: {}", e))
     })
+}
+
+fn parse_okx_subscription_ack(raw: &str) -> Result<Option<String>> {
+    let payload: OkxTickerPayload = serde_json::from_str(raw)
+        .map_err(|err| TickerError::ExchangeError(format!("Invalid OKX message: {err}")))?;
+    if payload.event.as_deref() == Some("error") {
+        return Err(okx_payload_error(payload));
+    }
+    if payload.event.as_deref() != Some("subscribe") {
+        return Ok(None);
+    }
+    let arg = payload.arg.ok_or_else(|| {
+        TickerError::ExchangeError("OKX subscription acknowledgement omitted arg".to_string())
+    })?;
+    if arg.channel != OKX_TICKERS_CHANNEL {
+        return Err(TickerError::ExchangeError(format!(
+            "OKX acknowledged unexpected channel {}",
+            arg.channel
+        )));
+    }
+    Ok(Some(arg.inst_id))
+}
+
+fn okx_payload_error(payload: OkxTickerPayload) -> TickerError {
+    let code = payload.code.unwrap_or_else(|| "unknown".to_string());
+    let msg = payload
+        .msg
+        .unwrap_or_else(|| "OKX WebSocket error".to_string());
+    TickerError::ExchangeError(format!("OKX WebSocket error {code}: {msg}"))
 }
 
 fn parse_okx_ticker_updates(raw: &str) -> Result<Vec<OkxTicker>> {
@@ -306,14 +355,7 @@ fn parse_okx_ticker_updates(raw: &str) -> Result<Vec<OkxTicker>> {
         .map_err(|e| TickerError::ExchangeError(format!("Invalid OKX message: {}", e)))?;
 
     if payload.event.as_deref() == Some("error") {
-        let code = payload.code.unwrap_or_else(|| "unknown".to_string());
-        let msg = payload
-            .msg
-            .unwrap_or_else(|| "OKX WebSocket error".to_string());
-        return Err(TickerError::ExchangeError(format!(
-            "OKX WebSocket error {}: {}",
-            code, msg
-        )));
+        return Err(okx_payload_error(payload));
     }
 
     payload
@@ -520,7 +562,10 @@ mod tests {
 
     #[test]
     fn okx_subscription_request_uses_tickers_channel_and_inst_id() {
-        let request = match build_okx_subscribe_request("BTC-USDT") {
+        let request = match build_okx_subscribe_request(&[
+            "BTC-USDT".to_string(),
+            "ETH-USDT".to_string(),
+        ]) {
             Ok(request) => request,
             Err(e) => panic!("subscription request should serialize: {e}"),
         };
@@ -537,6 +582,10 @@ mod tests {
                     {
                         "channel": "tickers",
                         "instId": "BTC-USDT"
+                    },
+                    {
+                        "channel": "tickers",
+                        "instId": "ETH-USDT"
                     }
                 ]
             })
@@ -595,6 +644,25 @@ mod tests {
         };
 
         assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn okx_subscription_ack_validates_pair_and_channel() {
+        let pair = parse_okx_subscription_ack(
+            r#"{
+                "event": "subscribe",
+                "arg": {"channel": "tickers", "instId": "BTC-USDT"},
+                "connId": "a4d3ae55"
+            }"#,
+        )
+        .expect("valid acknowledgement");
+        assert_eq!(pair.as_deref(), Some("BTC-USDT"));
+
+        let error = parse_okx_subscription_ack(
+            r#"{"event":"subscribe","arg":{"channel":"books","instId":"BTC-USDT"}}"#,
+        )
+        .expect_err("unexpected channel must fail");
+        assert!(error.to_string().contains("unexpected channel"));
     }
 
     #[test]
