@@ -97,7 +97,11 @@ impl TrayUI {
                     connection_status = "Connected";
 
                     // Use more efficient string formatting to reduce allocations
-                    let title = format!("{}: ${:.2}", price_update.pair, price_update.price);
+                    let title = format!(
+                        "{}: ${}",
+                        price_update.pair,
+                        price_update.price.format_with_precision(2)
+                    );
                     if let Some(ref mut tray) = tray_icon {
                         tray.set_title(Some(&title));
                     }

@@ -68,7 +68,7 @@ This project is currently source-only. Build and run it from a local checkout un
 ## Supported Exchanges
 
 - **OKX**: Primary exchange with full WebSocket streaming support
-- Extensible architecture for additional exchanges
+- Additional exchanges require a new streaming client implementation
 
 ## Architecture
 
@@ -85,7 +85,7 @@ The application is optimized for minimal resource usage:
 
 - Efficient tokio runtime configuration
 - Memory-optimized data structures
-- Connection pooling and reuse
+- Direct OKX public ticker WebSocket subscriptions
 - Configurable buffer sizes
 - Release build optimizations (LTO, strip symbols)
 
@@ -115,8 +115,8 @@ Set the `RUST_LOG` environment variable to control logging levels:
 # Debug logging
 RUST_LOG=debug cargo run
 
-# Exchange-specific logging
-RUST_LOG=exc_okx=debug,okx_streams=debug cargo run
+# App-specific logging
+RUST_LOG=okk=debug cargo run
 ```
 
 ## License
