@@ -168,10 +168,7 @@ impl TrayUI {
                             if let Some(ref mut tray) = tray_icon {
                                 tray.set_title(Some("Disconnected"));
                             }
-                            tracing::warn!(
-                                "No price updates received for {:?}",
-                                disconnect_after
-                            );
+                            tracing::warn!("No price updates received for {:?}", disconnect_after);
                         }
                     }
                 }
@@ -373,10 +370,7 @@ mod tests {
         apply_price_update(&mut prices, &mut generation, &update("BTC-USDT", "101", 1));
 
         assert_eq!(
-            format_combined_title(
-                &["BTC-USDT".into(), "ETH-USDT".into()],
-                &prices
-            ),
+            format_combined_title(&["BTC-USDT".into(), "ETH-USDT".into()], &prices),
             "BTC-USDT: $101.00 | ETH-USDT: $200.00"
         );
     }
