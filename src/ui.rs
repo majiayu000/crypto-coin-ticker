@@ -22,13 +22,62 @@
 
 use crate::config::Config;
 use crate::error::{Result, TickerError};
-use crate::exchange::PriceUpdate;
+use crate::exchange::{Price, PriceUpdate};
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::{
     TrayIconBuilder, TrayIconEvent,
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
+
+/// Silence window before the tray shows a disconnected status.
+///
+/// Must be at least twice `update_interval_secs` so intentional emission
+/// throttling cannot look like a dead connection when the interval is >30s.
+pub(crate) fn disconnect_silence_timeout(update_interval_secs: u64) -> Duration {
+    Duration::from_secs(update_interval_secs.saturating_mul(2).max(30))
+}
+
+/// Apply a price update onto the per-pair cache, clearing on reconnect.
+///
+/// When `connection_generation` advances, prior-connection prices are dropped so
+/// unrecovered pairs after a partial reconnect cannot linger beside live ones.
+/// Quiet but healthy pairs on the *same* generation are retained.
+pub(crate) fn apply_price_update(
+    prices: &mut HashMap<String, Price>,
+    current_generation: &mut u64,
+    update: &PriceUpdate,
+) {
+    if update.connection_generation != *current_generation {
+        prices.clear();
+        *current_generation = update.connection_generation;
+    }
+    prices.insert(update.pair.clone(), update.price.clone());
+}
+
+/// Format a combined tray title from configured pairs and the latest known prices.
+///
+/// Pairs are rendered in first-seen `configured_pairs` order (duplicates skipped).
+/// Pairs without a price yet are omitted. Returns an empty string when no prices
+/// are available.
+pub(crate) fn format_combined_title(
+    configured_pairs: &[String],
+    prices: &HashMap<String, Price>,
+) -> String {
+    let mut seen = HashSet::new();
+    configured_pairs
+        .iter()
+        .filter(|pair| seen.insert(pair.as_str()))
+        .filter_map(|pair| {
+            prices
+                .get(pair)
+                .map(|price| format!("{}: ${}", pair, price.format_with_precision(2)))
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
 
 /// Tray UI manager for displaying cryptocurrency prices in the system tray
 pub struct TrayUI {
@@ -81,8 +130,14 @@ impl TrayUI {
         let menu_channel = MenuEvent::receiver();
         let tray_channel = TrayIconEvent::receiver();
 
-        let mut last_price_update = std::time::Instant::now();
+        let mut last_price_update = Instant::now();
         let mut connection_status = "Connected";
+        let configured_pairs = self.config.trading_pairs.clone();
+        let disconnect_after = disconnect_silence_timeout(self.config.update_interval_secs);
+        // Cached prices keyed by pair; cleared when connection_generation advances.
+        // Do not clear on silence timeout — throttled same-generation pairs must survive.
+        let mut latest_prices: HashMap<String, Price> = HashMap::new();
+        let mut price_generation = 0_u64;
 
         tracing::info!("Starting UI event loop");
 
@@ -93,15 +148,11 @@ impl TrayUI {
             // Handle price updates with connection monitoring
             match price_rx.try_recv() {
                 Ok(price_update) => {
-                    last_price_update = std::time::Instant::now();
+                    last_price_update = Instant::now();
                     connection_status = "Connected";
 
-                    // Use more efficient string formatting to reduce allocations
-                    let title = format!(
-                        "{}: ${}",
-                        price_update.pair,
-                        price_update.price.format_with_precision(2)
-                    );
+                    apply_price_update(&mut latest_prices, &mut price_generation, &price_update);
+                    let title = format_combined_title(&configured_pairs, &latest_prices);
                     if let Some(ref mut tray) = tray_icon {
                         tray.set_title(Some(&title));
                     }
@@ -109,14 +160,15 @@ impl TrayUI {
                     tracing::debug!("Updated tray with: {}", title);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    // Check for connection timeout
-                    if last_price_update.elapsed() > std::time::Duration::from_secs(30) {
+                    // Advisory disconnect UI only. Cache expiry is generation-based via
+                    // apply_price_update so throttle gaps cannot drop quiet healthy pairs.
+                    if last_price_update.elapsed() > disconnect_after {
                         if connection_status != "Disconnected" {
                             connection_status = "Disconnected";
                             if let Some(ref mut tray) = tray_icon {
                                 tray.set_title(Some("Disconnected"));
                             }
-                            tracing::warn!("No price updates received for 30 seconds");
+                            tracing::warn!("No price updates received for {:?}", disconnect_after);
                         }
                     }
                 }
@@ -162,5 +214,164 @@ impl TrayUI {
 
         tray_icon::Icon::from_rgba(icon_rgba, icon_width, icon_height)
             .map_err(|e| TickerError::UIError(format!("Failed to create icon: {}", e)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn price(raw: &str) -> Price {
+        Price::parse(raw).expect("valid price")
+    }
+
+    fn update(pair: &str, raw_price: &str, generation: u64) -> PriceUpdate {
+        PriceUpdate {
+            pair: pair.to_string(),
+            price: price(raw_price),
+            timestamp_ms: 0,
+            connection_generation: generation,
+        }
+    }
+
+    #[test]
+    fn format_combined_title_single_pair() {
+        let pairs = vec!["BTC-USDT".to_string()];
+        let mut prices = HashMap::new();
+        prices.insert("BTC-USDT".to_string(), price("10000.5"));
+
+        assert_eq!(
+            format_combined_title(&pairs, &prices),
+            "BTC-USDT: $10000.50"
+        );
+    }
+
+    #[test]
+    fn format_combined_title_multi_pair_preserves_config_order() {
+        let pairs = vec![
+            "BTC-USDT".to_string(),
+            "ETH-USDT".to_string(),
+            "SOL-USDT".to_string(),
+        ];
+        let mut prices = HashMap::new();
+        // Insert out of order to ensure output follows configured order
+        prices.insert("ETH-USDT".to_string(), price("3000"));
+        prices.insert("SOL-USDT".to_string(), price("150.25"));
+        prices.insert("BTC-USDT".to_string(), price("65000.1"));
+
+        assert_eq!(
+            format_combined_title(&pairs, &prices),
+            "BTC-USDT: $65000.10 | ETH-USDT: $3000.00 | SOL-USDT: $150.25"
+        );
+    }
+
+    #[test]
+    fn format_combined_title_upsert_overwrites_same_pair() {
+        let pairs = vec!["BTC-USDT".to_string(), "ETH-USDT".to_string()];
+        let mut prices = HashMap::new();
+        prices.insert("BTC-USDT".to_string(), price("100"));
+        prices.insert("ETH-USDT".to_string(), price("200"));
+        prices.insert("BTC-USDT".to_string(), price("101.5"));
+
+        assert_eq!(
+            format_combined_title(&pairs, &prices),
+            "BTC-USDT: $101.50 | ETH-USDT: $200.00"
+        );
+    }
+
+    #[test]
+    fn format_combined_title_omits_pairs_without_price() {
+        let pairs = vec![
+            "BTC-USDT".to_string(),
+            "ETH-USDT".to_string(),
+            "SOL-USDT".to_string(),
+        ];
+        let mut prices = HashMap::new();
+        prices.insert("ETH-USDT".to_string(), price("2500"));
+
+        assert_eq!(format_combined_title(&pairs, &prices), "ETH-USDT: $2500.00");
+    }
+
+    #[test]
+    fn format_combined_title_empty_when_no_prices() {
+        let pairs = vec!["BTC-USDT".to_string(), "ETH-USDT".to_string()];
+        let prices = HashMap::new();
+
+        assert_eq!(format_combined_title(&pairs, &prices), "");
+    }
+
+    #[test]
+    fn format_combined_title_dedupes_duplicate_configured_pairs() {
+        let pairs = vec![
+            "BTC-USDT".to_string(),
+            "ETH-USDT".to_string(),
+            "BTC-USDT".to_string(),
+        ];
+        let mut prices = HashMap::new();
+        prices.insert("BTC-USDT".to_string(), price("100"));
+        prices.insert("ETH-USDT".to_string(), price("200"));
+
+        assert_eq!(
+            format_combined_title(&pairs, &prices),
+            "BTC-USDT: $100.00 | ETH-USDT: $200.00"
+        );
+    }
+
+    #[test]
+    fn apply_price_update_keeps_quiet_pairs_on_same_generation() {
+        let mut prices = HashMap::new();
+        let mut generation = 0;
+        apply_price_update(&mut prices, &mut generation, &update("BTC-USDT", "100", 1));
+        apply_price_update(&mut prices, &mut generation, &update("ETH-USDT", "200", 1));
+        // Only BTC updates again; ETH stays cached because generation is unchanged.
+        apply_price_update(&mut prices, &mut generation, &update("BTC-USDT", "101", 1));
+
+        assert_eq!(generation, 1);
+        assert_eq!(prices.len(), 2);
+        assert_eq!(
+            prices.get("BTC-USDT").map(|p| p.format_with_precision(2)),
+            Some("101.00".to_string())
+        );
+        assert!(prices.contains_key("ETH-USDT"));
+    }
+
+    #[test]
+    fn apply_price_update_clears_prior_generation_on_reconnect() {
+        let mut prices = HashMap::new();
+        let mut generation = 0;
+        apply_price_update(&mut prices, &mut generation, &update("BTC-USDT", "100", 1));
+        apply_price_update(&mut prices, &mut generation, &update("ETH-USDT", "200", 1));
+        // Partial reconnect: only BTC recovers on generation 2.
+        apply_price_update(&mut prices, &mut generation, &update("BTC-USDT", "105", 2));
+
+        assert_eq!(generation, 2);
+        assert_eq!(prices.len(), 1);
+        assert!(prices.contains_key("BTC-USDT"));
+        assert!(!prices.contains_key("ETH-USDT"));
+    }
+
+    #[test]
+    fn disconnect_silence_timeout_scales_with_update_interval() {
+        assert_eq!(disconnect_silence_timeout(1), Duration::from_secs(30));
+        assert_eq!(disconnect_silence_timeout(30), Duration::from_secs(60));
+        assert_eq!(disconnect_silence_timeout(60), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn silence_timeout_does_not_require_cache_clear_for_same_generation() {
+        // Documented contract: after a long throttle gap, the next same-generation
+        // update must still see previously cached quiet pairs.
+        let mut prices = HashMap::new();
+        let mut generation = 0;
+        apply_price_update(&mut prices, &mut generation, &update("BTC-USDT", "100", 1));
+        apply_price_update(&mut prices, &mut generation, &update("ETH-USDT", "200", 1));
+        // Simulate UI silence handling: status flip only — no cache clear.
+        let _ = disconnect_silence_timeout(60);
+        apply_price_update(&mut prices, &mut generation, &update("BTC-USDT", "101", 1));
+
+        assert_eq!(
+            format_combined_title(&["BTC-USDT".into(), "ETH-USDT".into()], &prices),
+            "BTC-USDT: $101.00 | ETH-USDT: $200.00"
+        );
     }
 }

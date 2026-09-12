@@ -148,6 +148,15 @@ impl Config {
             ));
         }
 
+        let mut seen = std::collections::HashSet::new();
+        for pair in &self.trading_pairs {
+            if !seen.insert(pair.as_str()) {
+                return Err(TickerError::ConfigError(format!(
+                    "duplicate trading pair: {pair}"
+                )));
+            }
+        }
+
         Ok(())
     }
 }
@@ -227,6 +236,39 @@ debug_logging = false
             error
                 .to_string()
                 .contains("update_interval_secs must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn duplicate_trading_pairs_are_rejected() {
+        let path = temp_config_path("duplicate-pairs");
+        let duplicate_pairs_config = r#"
+trading_pairs = ["BTC-USDT", "ETH-USDT", "BTC-USDT"]
+update_interval_secs = 1
+ws_connection_timeout_secs = 2
+ws_ping_timeout_secs = 5
+icon_path = "icons/icon.png"
+tooltip = "Crypto Ticker"
+max_buffer_size = 1000
+debug_logging = false
+"#;
+
+        if let Err(e) = std::fs::write(&path, duplicate_pairs_config) {
+            panic!("test config should be writable: {e}");
+        }
+
+        let error = match Config::from_file(&path) {
+            Ok(_) => panic!("duplicate trading pairs should fail validation"),
+            Err(error) => error,
+        };
+
+        if let Err(e) = std::fs::remove_file(path) {
+            panic!("test config should be removable: {e}");
+        }
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate trading pair: BTC-USDT")
         );
     }
 }
