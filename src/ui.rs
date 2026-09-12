@@ -22,13 +22,33 @@
 
 use crate::config::Config;
 use crate::error::{Result, TickerError};
-use crate::exchange::PriceUpdate;
+use crate::exchange::{Price, PriceUpdate};
+use std::collections::HashMap;
 use std::sync::mpsc::Receiver;
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::{
     TrayIconBuilder, TrayIconEvent,
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
+
+/// Format a combined tray title from configured pairs and the latest known prices.
+///
+/// Pairs are rendered in `configured_pairs` order. Pairs without a price yet are omitted.
+/// Returns an empty string when no prices are available.
+pub(crate) fn format_combined_title(
+    configured_pairs: &[String],
+    prices: &HashMap<String, Price>,
+) -> String {
+    configured_pairs
+        .iter()
+        .filter_map(|pair| {
+            prices.get(pair).map(|price| {
+                format!("{}: ${}", pair, price.format_with_precision(2))
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
 
 /// Tray UI manager for displaying cryptocurrency prices in the system tray
 pub struct TrayUI {
@@ -83,6 +103,8 @@ impl TrayUI {
 
         let mut last_price_update = std::time::Instant::now();
         let mut connection_status = "Connected";
+        let configured_pairs = self.config.trading_pairs.clone();
+        let mut latest_prices: HashMap<String, Price> = HashMap::new();
 
         tracing::info!("Starting UI event loop");
 
@@ -96,12 +118,8 @@ impl TrayUI {
                     last_price_update = std::time::Instant::now();
                     connection_status = "Connected";
 
-                    // Use more efficient string formatting to reduce allocations
-                    let title = format!(
-                        "{}: ${}",
-                        price_update.pair,
-                        price_update.price.format_with_precision(2)
-                    );
+                    latest_prices.insert(price_update.pair, price_update.price);
+                    let title = format_combined_title(&configured_pairs, &latest_prices);
                     if let Some(ref mut tray) = tray_icon {
                         tray.set_title(Some(&title));
                     }
@@ -162,5 +180,83 @@ impl TrayUI {
 
         tray_icon::Icon::from_rgba(icon_rgba, icon_width, icon_height)
             .map_err(|e| TickerError::UIError(format!("Failed to create icon: {}", e)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn price(raw: &str) -> Price {
+        Price::parse(raw).expect("valid price")
+    }
+
+    #[test]
+    fn format_combined_title_single_pair() {
+        let pairs = vec!["BTC-USDT".to_string()];
+        let mut prices = HashMap::new();
+        prices.insert("BTC-USDT".to_string(), price("10000.5"));
+
+        assert_eq!(
+            format_combined_title(&pairs, &prices),
+            "BTC-USDT: $10000.50"
+        );
+    }
+
+    #[test]
+    fn format_combined_title_multi_pair_preserves_config_order() {
+        let pairs = vec![
+            "BTC-USDT".to_string(),
+            "ETH-USDT".to_string(),
+            "SOL-USDT".to_string(),
+        ];
+        let mut prices = HashMap::new();
+        // Insert out of order to ensure output follows configured order
+        prices.insert("ETH-USDT".to_string(), price("3000"));
+        prices.insert("SOL-USDT".to_string(), price("150.25"));
+        prices.insert("BTC-USDT".to_string(), price("65000.1"));
+
+        assert_eq!(
+            format_combined_title(&pairs, &prices),
+            "BTC-USDT: $65000.10 | ETH-USDT: $3000.00 | SOL-USDT: $150.25"
+        );
+    }
+
+    #[test]
+    fn format_combined_title_upsert_overwrites_same_pair() {
+        let pairs = vec!["BTC-USDT".to_string(), "ETH-USDT".to_string()];
+        let mut prices = HashMap::new();
+        prices.insert("BTC-USDT".to_string(), price("100"));
+        prices.insert("ETH-USDT".to_string(), price("200"));
+        prices.insert("BTC-USDT".to_string(), price("101.5"));
+
+        assert_eq!(
+            format_combined_title(&pairs, &prices),
+            "BTC-USDT: $101.50 | ETH-USDT: $200.00"
+        );
+    }
+
+    #[test]
+    fn format_combined_title_omits_pairs_without_price() {
+        let pairs = vec![
+            "BTC-USDT".to_string(),
+            "ETH-USDT".to_string(),
+            "SOL-USDT".to_string(),
+        ];
+        let mut prices = HashMap::new();
+        prices.insert("ETH-USDT".to_string(), price("2500"));
+
+        assert_eq!(
+            format_combined_title(&pairs, &prices),
+            "ETH-USDT: $2500.00"
+        );
+    }
+
+    #[test]
+    fn format_combined_title_empty_when_no_prices() {
+        let pairs = vec!["BTC-USDT".to_string(), "ETH-USDT".to_string()];
+        let prices = HashMap::new();
+
+        assert_eq!(format_combined_title(&pairs, &prices), "");
     }
 }
