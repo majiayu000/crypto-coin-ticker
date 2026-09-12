@@ -23,24 +23,45 @@
 use crate::config::Config;
 use crate::error::{Result, TickerError};
 use crate::exchange::{Price, PriceUpdate};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::{
     TrayIconBuilder, TrayIconEvent,
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
 
+/// Drop pairs that lag the freshest update by more than `max_lag`.
+///
+/// After a short outage with only some subscriptions confirmed, recovered pairs keep
+/// updating while unrecovered ones retain pre-outage timestamps. Lag-based pruning
+/// removes those stale entries even though global silence never reaches 30s.
+pub(crate) fn prune_lagging_prices(
+    prices: &mut HashMap<String, (Price, Instant)>,
+    max_lag: Duration,
+) -> bool {
+    let Some(newest) = prices.values().map(|(_, updated_at)| *updated_at).max() else {
+        return false;
+    };
+    let before = prices.len();
+    prices.retain(|_, (_, updated_at)| newest.duration_since(*updated_at) <= max_lag);
+    prices.len() != before
+}
+
 /// Format a combined tray title from configured pairs and the latest known prices.
 ///
-/// Pairs are rendered in `configured_pairs` order. Pairs without a price yet are omitted.
-/// Returns an empty string when no prices are available.
+/// Pairs are rendered in first-seen `configured_pairs` order (duplicates skipped).
+/// Pairs without a price yet are omitted. Returns an empty string when no prices
+/// are available.
 pub(crate) fn format_combined_title(
     configured_pairs: &[String],
     prices: &HashMap<String, Price>,
 ) -> String {
+    let mut seen = HashSet::new();
     configured_pairs
         .iter()
+        .filter(|pair| seen.insert(pair.as_str()))
         .filter_map(|pair| {
             prices
                 .get(pair)
@@ -48,6 +69,13 @@ pub(crate) fn format_combined_title(
         })
         .collect::<Vec<_>>()
         .join(" | ")
+}
+
+fn title_prices(cached: &HashMap<String, (Price, Instant)>) -> HashMap<String, Price> {
+    cached
+        .iter()
+        .map(|(pair, (price, _))| (pair.clone(), price.clone()))
+        .collect()
 }
 
 /// Tray UI manager for displaying cryptocurrency prices in the system tray
@@ -101,10 +129,14 @@ impl TrayUI {
         let menu_channel = MenuEvent::receiver();
         let tray_channel = TrayIconEvent::receiver();
 
-        let mut last_price_update = std::time::Instant::now();
+        let mut last_price_update = Instant::now();
         let mut connection_status = "Connected";
         let configured_pairs = self.config.trading_pairs.clone();
-        let mut latest_prices: HashMap<String, Price> = HashMap::new();
+        // Per-pair timestamps let us expire unrecovered pairs after a partial reconnect.
+        let mut latest_prices: HashMap<String, (Price, Instant)> = HashMap::new();
+        // Allow a pair to lag the freshest update by twice the ping timeout before expiry.
+        let pair_max_lag =
+            Duration::from_secs(self.config.ws_ping_timeout_secs.saturating_mul(2).max(2));
 
         tracing::info!("Starting UI event loop");
 
@@ -115,11 +147,14 @@ impl TrayUI {
             // Handle price updates with connection monitoring
             match price_rx.try_recv() {
                 Ok(price_update) => {
-                    last_price_update = std::time::Instant::now();
+                    last_price_update = Instant::now();
                     connection_status = "Connected";
 
-                    latest_prices.insert(price_update.pair, price_update.price);
-                    let title = format_combined_title(&configured_pairs, &latest_prices);
+                    latest_prices
+                        .insert(price_update.pair, (price_update.price, last_price_update));
+                    prune_lagging_prices(&mut latest_prices, pair_max_lag);
+                    let title =
+                        format_combined_title(&configured_pairs, &title_prices(&latest_prices));
                     if let Some(ref mut tray) = tray_icon {
                         tray.set_title(Some(&title));
                     }
@@ -127,8 +162,19 @@ impl TrayUI {
                     tracing::debug!("Updated tray with: {}", title);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if prune_lagging_prices(&mut latest_prices, pair_max_lag) {
+                        let title =
+                            format_combined_title(&configured_pairs, &title_prices(&latest_prices));
+                        if let Some(ref mut tray) = tray_icon {
+                            if title.is_empty() {
+                                tray.set_title(Some("Disconnected"));
+                            } else {
+                                tray.set_title(Some(&title));
+                            }
+                        }
+                    }
                     // Check for connection timeout
-                    if last_price_update.elapsed() > std::time::Duration::from_secs(30) {
+                    if last_price_update.elapsed() > Duration::from_secs(30) {
                         if connection_status != "Disconnected" {
                             connection_status = "Disconnected";
                             // Drop cached prices so a partial reconnect cannot resurrect
@@ -258,5 +304,47 @@ mod tests {
         let prices = HashMap::new();
 
         assert_eq!(format_combined_title(&pairs, &prices), "");
+    }
+
+    #[test]
+    fn format_combined_title_dedupes_duplicate_configured_pairs() {
+        let pairs = vec![
+            "BTC-USDT".to_string(),
+            "ETH-USDT".to_string(),
+            "BTC-USDT".to_string(),
+        ];
+        let mut prices = HashMap::new();
+        prices.insert("BTC-USDT".to_string(), price("100"));
+        prices.insert("ETH-USDT".to_string(), price("200"));
+
+        assert_eq!(
+            format_combined_title(&pairs, &prices),
+            "BTC-USDT: $100.00 | ETH-USDT: $200.00"
+        );
+    }
+
+    #[test]
+    fn prune_lagging_prices_drops_unrecovered_pair() {
+        let mut prices = HashMap::new();
+        let stale_at = Instant::now() - Duration::from_secs(15);
+        let fresh_at = Instant::now();
+        prices.insert("ETH-USDT".to_string(), (price("200"), stale_at));
+        prices.insert("BTC-USDT".to_string(), (price("100"), fresh_at));
+
+        assert!(prune_lagging_prices(&mut prices, Duration::from_secs(10)));
+        assert!(prices.contains_key("BTC-USDT"));
+        assert!(!prices.contains_key("ETH-USDT"));
+    }
+
+    #[test]
+    fn prune_lagging_prices_keeps_pairs_within_lag() {
+        let mut prices = HashMap::new();
+        let older = Instant::now() - Duration::from_secs(3);
+        let newer = Instant::now();
+        prices.insert("ETH-USDT".to_string(), (price("200"), older));
+        prices.insert("BTC-USDT".to_string(), (price("100"), newer));
+
+        assert!(!prune_lagging_prices(&mut prices, Duration::from_secs(10)));
+        assert_eq!(prices.len(), 2);
     }
 }
