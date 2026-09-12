@@ -42,9 +42,9 @@ pub(crate) fn format_combined_title(
     configured_pairs
         .iter()
         .filter_map(|pair| {
-            prices.get(pair).map(|price| {
-                format!("{}: ${}", pair, price.format_with_precision(2))
-            })
+            prices
+                .get(pair)
+                .map(|price| format!("{}: ${}", pair, price.format_with_precision(2)))
         })
         .collect::<Vec<_>>()
         .join(" | ")
@@ -131,6 +131,9 @@ impl TrayUI {
                     if last_price_update.elapsed() > std::time::Duration::from_secs(30) {
                         if connection_status != "Disconnected" {
                             connection_status = "Disconnected";
+                            // Drop cached prices so a partial reconnect cannot resurrect
+                            // stale pair values beside freshly recovered ones.
+                            latest_prices.clear();
                             if let Some(ref mut tray) = tray_icon {
                                 tray.set_title(Some("Disconnected"));
                             }
@@ -246,10 +249,7 @@ mod tests {
         let mut prices = HashMap::new();
         prices.insert("ETH-USDT".to_string(), price("2500"));
 
-        assert_eq!(
-            format_combined_title(&pairs, &prices),
-            "ETH-USDT: $2500.00"
-        );
+        assert_eq!(format_combined_title(&pairs, &prices), "ETH-USDT: $2500.00");
     }
 
     #[test]
