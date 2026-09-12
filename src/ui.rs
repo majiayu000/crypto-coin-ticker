@@ -32,6 +32,14 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
 
+/// Silence window before the tray shows a disconnected status.
+///
+/// Must be at least twice `update_interval_secs` so intentional emission
+/// throttling cannot look like a dead connection when the interval is >30s.
+pub(crate) fn disconnect_silence_timeout(update_interval_secs: u64) -> Duration {
+    Duration::from_secs(update_interval_secs.saturating_mul(2).max(30))
+}
+
 /// Apply a price update onto the per-pair cache, clearing on reconnect.
 ///
 /// When `connection_generation` advances, prior-connection prices are dropped so
@@ -125,7 +133,9 @@ impl TrayUI {
         let mut last_price_update = Instant::now();
         let mut connection_status = "Connected";
         let configured_pairs = self.config.trading_pairs.clone();
+        let disconnect_after = disconnect_silence_timeout(self.config.update_interval_secs);
         // Cached prices keyed by pair; cleared when connection_generation advances.
+        // Do not clear on silence timeout — throttled same-generation pairs must survive.
         let mut latest_prices: HashMap<String, Price> = HashMap::new();
         let mut price_generation = 0_u64;
 
@@ -150,18 +160,18 @@ impl TrayUI {
                     tracing::debug!("Updated tray with: {}", title);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    // Check for connection timeout
-                    if last_price_update.elapsed() > Duration::from_secs(30) {
+                    // Advisory disconnect UI only. Cache expiry is generation-based via
+                    // apply_price_update so throttle gaps cannot drop quiet healthy pairs.
+                    if last_price_update.elapsed() > disconnect_after {
                         if connection_status != "Disconnected" {
                             connection_status = "Disconnected";
-                            // Drop cached prices so a later reconnect cannot resurrect
-                            // stale pair values beside freshly recovered ones.
-                            latest_prices.clear();
-                            price_generation = 0;
                             if let Some(ref mut tray) = tray_icon {
                                 tray.set_title(Some("Disconnected"));
                             }
-                            tracing::warn!("No price updates received for 30 seconds");
+                            tracing::warn!(
+                                "No price updates received for {:?}",
+                                disconnect_after
+                            );
                         }
                     }
                 }
@@ -341,5 +351,33 @@ mod tests {
         assert_eq!(prices.len(), 1);
         assert!(prices.contains_key("BTC-USDT"));
         assert!(!prices.contains_key("ETH-USDT"));
+    }
+
+    #[test]
+    fn disconnect_silence_timeout_scales_with_update_interval() {
+        assert_eq!(disconnect_silence_timeout(1), Duration::from_secs(30));
+        assert_eq!(disconnect_silence_timeout(30), Duration::from_secs(60));
+        assert_eq!(disconnect_silence_timeout(60), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn silence_timeout_does_not_require_cache_clear_for_same_generation() {
+        // Documented contract: after a long throttle gap, the next same-generation
+        // update must still see previously cached quiet pairs.
+        let mut prices = HashMap::new();
+        let mut generation = 0;
+        apply_price_update(&mut prices, &mut generation, &update("BTC-USDT", "100", 1));
+        apply_price_update(&mut prices, &mut generation, &update("ETH-USDT", "200", 1));
+        // Simulate UI silence handling: status flip only — no cache clear.
+        let _ = disconnect_silence_timeout(60);
+        apply_price_update(&mut prices, &mut generation, &update("BTC-USDT", "101", 1));
+
+        assert_eq!(
+            format_combined_title(
+                &["BTC-USDT".into(), "ETH-USDT".into()],
+                &prices
+            ),
+            "BTC-USDT: $101.00 | ETH-USDT: $200.00"
+        );
     }
 }
