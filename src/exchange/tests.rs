@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::mpsc::sync_channel;
 
 #[test]
 fn update_interval_allows_first_update() {
@@ -231,6 +232,27 @@ fn okx_error_event_reports_exchange_error() {
     };
 
     assert!(error.to_string().contains("OKX WebSocket error 60012"));
+}
+
+#[tokio::test]
+async fn start_price_monitoring_rejects_empty_trading_pairs() {
+    let config = Config {
+        trading_pairs: vec![],
+        ..Config::default()
+    };
+    let (tx, _rx) = sync_channel::<PriceUpdate>(config.max_buffer_size);
+    let client = ExchangeClient::new(config);
+
+    let error = match client.start_price_monitoring(tx).await {
+        Ok(_) => panic!("empty trading_pairs should fail monitoring start"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains("trading_pairs must not be empty")
+    );
 }
 
 fn price(raw: &str) -> Price {

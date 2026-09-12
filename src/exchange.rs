@@ -65,7 +65,9 @@ impl ExchangeClient {
         );
 
         if self.config.trading_pairs.is_empty() {
-            return Ok(Vec::new());
+            return Err(TickerError::ConfigError(
+                "trading_pairs must not be empty".to_string(),
+            ));
         }
 
         let pairs = self.config.trading_pairs.clone();

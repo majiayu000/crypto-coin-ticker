@@ -148,7 +148,34 @@ impl Config {
             ));
         }
 
+        if self.trading_pairs.is_empty() {
+            return Err(TickerError::ConfigError(
+                "trading_pairs must not be empty".to_string(),
+            ));
+        }
+
+        for pair in &self.trading_pairs {
+            Self::validate_trading_pair(pair)?;
+        }
+
         Ok(())
+    }
+
+    /// Validate an OKX-style instrument id (`BASE-QUOTE`, optionally with more hyphen segments).
+    fn validate_trading_pair(pair: &str) -> Result<()> {
+        let trimmed = pair.trim();
+        if trimmed.is_empty() {
+            return Err(TickerError::ConfigError(
+                "trading_pairs entries must not be blank".to_string(),
+            ));
+        }
+
+        match trimmed.split_once('-') {
+            Some((base, quote)) if !base.is_empty() && !quote.is_empty() => Ok(()),
+            _ => Err(TickerError::ConfigError(format!(
+                "invalid trading pair '{pair}': expected OKX-style BASE-QUOTE instId"
+            ))),
+        }
     }
 }
 
@@ -228,5 +255,64 @@ debug_logging = false
                 .to_string()
                 .contains("update_interval_secs must be greater than zero")
         );
+    }
+
+    fn valid_config_with_pairs(pairs: Vec<String>) -> Config {
+        Config {
+            trading_pairs: pairs,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn empty_trading_pairs_are_rejected() {
+        let error = match valid_config_with_pairs(vec![]).validate() {
+            Ok(_) => panic!("empty trading_pairs should fail validation"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("trading_pairs must not be empty")
+        );
+    }
+
+    #[test]
+    fn blank_trading_pair_entries_are_rejected() {
+        let error = match valid_config_with_pairs(vec!["   ".to_string()]).validate() {
+            Ok(_) => panic!("blank trading_pairs entry should fail validation"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("trading_pairs entries must not be blank")
+        );
+    }
+
+    #[test]
+    fn invalid_inst_id_entries_are_rejected() {
+        for pair in ["BTC", "-USDT", "BTC-", "ETHUSDT"] {
+            let error = match valid_config_with_pairs(vec![pair.to_string()]).validate() {
+                Ok(_) => panic!("invalid instId '{pair}' should fail validation"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("invalid trading pair"),
+                "unexpected error for '{pair}': {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_trading_pairs_pass_validation() {
+        let config = valid_config_with_pairs(vec![
+            "BTC-USDT".to_string(),
+            "ETH-USDT".to_string(),
+            "BTC-USDT-SWAP".to_string(),
+        ]);
+        if let Err(e) = config.validate() {
+            panic!("valid trading_pairs should pass: {e}");
+        }
     }
 }
