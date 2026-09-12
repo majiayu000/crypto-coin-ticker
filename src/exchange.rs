@@ -90,15 +90,25 @@ impl ExchangeClient {
     ) {
         let mut consecutive_errors = 0_u32;
         let mut last_sent_at = HashMap::<String, Instant>::new();
+        let mut connection_generation = 0_u64;
         const BASE_BACKOFF_SECS: u64 = 1;
 
         loop {
-            tracing::info!("Connecting to OKX for {} pairs", pairs.len());
+            // Each reconnect starts a new generation so the UI can drop prices
+            // from unrecovered pairs without lag-based guessing.
+            connection_generation = connection_generation.saturating_add(1);
+            last_sent_at.clear();
+            tracing::info!(
+                "Connecting to OKX for {} pairs (generation {})",
+                pairs.len(),
+                connection_generation
+            );
             let result = Self::run_connection(
                 &tx,
                 &pairs,
                 &mut last_sent_at,
                 &mut consecutive_errors,
+                connection_generation,
                 update_interval,
                 connection_timeout,
                 pong_timeout,
@@ -135,6 +145,7 @@ impl ExchangeClient {
         pairs: &[String],
         last_sent_at: &mut HashMap<String, Instant>,
         consecutive_errors: &mut u32,
+        connection_generation: u64,
         update_interval: Duration,
         connection_timeout: Duration,
         pong_timeout: Duration,
@@ -179,6 +190,7 @@ impl ExchangeClient {
                                 tx,
                                 last_sent_at,
                                 consecutive_errors,
+                                connection_generation,
                                 update_interval,
                                 updates,
                             )?,
@@ -274,6 +286,7 @@ impl ExchangeClient {
                             tx,
                             last_sent_at,
                             consecutive_errors,
+                            connection_generation,
                             update_interval,
                             updates,
                         )?;
@@ -295,6 +308,7 @@ impl ExchangeClient {
         tx: &SyncSender<PriceUpdate>,
         last_sent_at: &mut HashMap<String, Instant>,
         consecutive_errors: &mut u32,
+        connection_generation: u64,
         update_interval: Duration,
         updates: Vec<OkxTicker>,
     ) -> Result<()> {
@@ -311,7 +325,11 @@ impl ExchangeClient {
                 continue;
             }
             let pair = ticker.pair.clone();
-            match tx.try_send(PriceUpdate::new(ticker.pair, ticker.last)) {
+            match tx.try_send(PriceUpdate::new(
+                ticker.pair,
+                ticker.last,
+                connection_generation,
+            )) {
                 Ok(()) => {
                     last_sent_at.insert(pair, now);
                 }
@@ -676,6 +694,8 @@ pub struct PriceUpdate {
     pub price: Price,
     /// Unix timestamp in milliseconds for better performance
     pub timestamp_ms: i64,
+    /// Monotonic OKX connection generation; bumps on every reconnect.
+    pub connection_generation: u64,
 }
 
 #[cfg(test)]
@@ -683,11 +703,12 @@ mod tests;
 
 impl PriceUpdate {
     /// Create a new price update with current timestamp
-    pub fn new(pair: String, price: Price) -> Self {
+    pub fn new(pair: String, price: Price, connection_generation: u64) -> Self {
         Self {
             pair,
             price,
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
+            connection_generation,
         }
     }
 

@@ -32,32 +32,21 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
 
-/// Stale-lag window for per-pair tray price expiry.
+/// Apply a price update onto the per-pair cache, clearing on reconnect.
 ///
-/// Must be at least `update_interval_secs` so throttled healthy pairs are not
-/// pruned when another pair emits first. Also keep the prior `2 * ping`
-/// floor so short partial-reconnect gaps still expire unrecovered pairs.
-pub(crate) fn pair_max_lag_secs(update_interval_secs: u64, ws_ping_timeout_secs: u64) -> u64 {
-    update_interval_secs
-        .max(ws_ping_timeout_secs.saturating_mul(2))
-        .max(2)
-}
-
-/// Drop pairs that lag the freshest update by more than `max_lag`.
-///
-/// After a short outage with only some subscriptions confirmed, recovered pairs keep
-/// updating while unrecovered ones retain pre-outage timestamps. Lag-based pruning
-/// removes those stale entries even though global silence never reaches 30s.
-pub(crate) fn prune_lagging_prices(
-    prices: &mut HashMap<String, (Price, Instant)>,
-    max_lag: Duration,
-) -> bool {
-    let Some(newest) = prices.values().map(|(_, updated_at)| *updated_at).max() else {
-        return false;
-    };
-    let before = prices.len();
-    prices.retain(|_, (_, updated_at)| newest.duration_since(*updated_at) <= max_lag);
-    prices.len() != before
+/// When `connection_generation` advances, prior-connection prices are dropped so
+/// unrecovered pairs after a partial reconnect cannot linger beside live ones.
+/// Quiet but healthy pairs on the *same* generation are retained.
+pub(crate) fn apply_price_update(
+    prices: &mut HashMap<String, Price>,
+    current_generation: &mut u64,
+    update: &PriceUpdate,
+) {
+    if update.connection_generation != *current_generation {
+        prices.clear();
+        *current_generation = update.connection_generation;
+    }
+    prices.insert(update.pair.clone(), update.price.clone());
 }
 
 /// Format a combined tray title from configured pairs and the latest known prices.
@@ -80,13 +69,6 @@ pub(crate) fn format_combined_title(
         })
         .collect::<Vec<_>>()
         .join(" | ")
-}
-
-fn title_prices(cached: &HashMap<String, (Price, Instant)>) -> HashMap<String, Price> {
-    cached
-        .iter()
-        .map(|(pair, (price, _))| (pair.clone(), price.clone()))
-        .collect()
 }
 
 /// Tray UI manager for displaying cryptocurrency prices in the system tray
@@ -143,13 +125,9 @@ impl TrayUI {
         let mut last_price_update = Instant::now();
         let mut connection_status = "Connected";
         let configured_pairs = self.config.trading_pairs.clone();
-        // Per-pair timestamps let us expire unrecovered pairs after a partial reconnect.
-        let mut latest_prices: HashMap<String, (Price, Instant)> = HashMap::new();
-        // Lag window covers both ping-timeout gaps and the configured emission interval.
-        let pair_max_lag = Duration::from_secs(pair_max_lag_secs(
-            self.config.update_interval_secs,
-            self.config.ws_ping_timeout_secs,
-        ));
+        // Cached prices keyed by pair; cleared when connection_generation advances.
+        let mut latest_prices: HashMap<String, Price> = HashMap::new();
+        let mut price_generation = 0_u64;
 
         tracing::info!("Starting UI event loop");
 
@@ -163,11 +141,8 @@ impl TrayUI {
                     last_price_update = Instant::now();
                     connection_status = "Connected";
 
-                    latest_prices
-                        .insert(price_update.pair, (price_update.price, last_price_update));
-                    prune_lagging_prices(&mut latest_prices, pair_max_lag);
-                    let title =
-                        format_combined_title(&configured_pairs, &title_prices(&latest_prices));
+                    apply_price_update(&mut latest_prices, &mut price_generation, &price_update);
+                    let title = format_combined_title(&configured_pairs, &latest_prices);
                     if let Some(ref mut tray) = tray_icon {
                         tray.set_title(Some(&title));
                     }
@@ -175,24 +150,14 @@ impl TrayUI {
                     tracing::debug!("Updated tray with: {}", title);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    if prune_lagging_prices(&mut latest_prices, pair_max_lag) {
-                        let title =
-                            format_combined_title(&configured_pairs, &title_prices(&latest_prices));
-                        if let Some(ref mut tray) = tray_icon {
-                            if title.is_empty() {
-                                tray.set_title(Some("Disconnected"));
-                            } else {
-                                tray.set_title(Some(&title));
-                            }
-                        }
-                    }
                     // Check for connection timeout
                     if last_price_update.elapsed() > Duration::from_secs(30) {
                         if connection_status != "Disconnected" {
                             connection_status = "Disconnected";
-                            // Drop cached prices so a partial reconnect cannot resurrect
+                            // Drop cached prices so a later reconnect cannot resurrect
                             // stale pair values beside freshly recovered ones.
                             latest_prices.clear();
+                            price_generation = 0;
                             if let Some(ref mut tray) = tray_icon {
                                 tray.set_title(Some("Disconnected"));
                             }
@@ -251,6 +216,15 @@ mod tests {
 
     fn price(raw: &str) -> Price {
         Price::parse(raw).expect("valid price")
+    }
+
+    fn update(pair: &str, raw_price: &str, generation: u64) -> PriceUpdate {
+        PriceUpdate {
+            pair: pair.to_string(),
+            price: price(raw_price),
+            timestamp_ms: 0,
+            connection_generation: generation,
+        }
     }
 
     #[test]
@@ -337,48 +311,35 @@ mod tests {
     }
 
     #[test]
-    fn prune_lagging_prices_drops_unrecovered_pair() {
+    fn apply_price_update_keeps_quiet_pairs_on_same_generation() {
         let mut prices = HashMap::new();
-        let stale_at = Instant::now() - Duration::from_secs(15);
-        let fresh_at = Instant::now();
-        prices.insert("ETH-USDT".to_string(), (price("200"), stale_at));
-        prices.insert("BTC-USDT".to_string(), (price("100"), fresh_at));
+        let mut generation = 0;
+        apply_price_update(&mut prices, &mut generation, &update("BTC-USDT", "100", 1));
+        apply_price_update(&mut prices, &mut generation, &update("ETH-USDT", "200", 1));
+        // Only BTC updates again; ETH stays cached because generation is unchanged.
+        apply_price_update(&mut prices, &mut generation, &update("BTC-USDT", "101", 1));
 
-        assert!(prune_lagging_prices(&mut prices, Duration::from_secs(10)));
+        assert_eq!(generation, 1);
+        assert_eq!(prices.len(), 2);
+        assert_eq!(
+            prices.get("BTC-USDT").map(|p| p.format_with_precision(2)),
+            Some("101.00".to_string())
+        );
+        assert!(prices.contains_key("ETH-USDT"));
+    }
+
+    #[test]
+    fn apply_price_update_clears_prior_generation_on_reconnect() {
+        let mut prices = HashMap::new();
+        let mut generation = 0;
+        apply_price_update(&mut prices, &mut generation, &update("BTC-USDT", "100", 1));
+        apply_price_update(&mut prices, &mut generation, &update("ETH-USDT", "200", 1));
+        // Partial reconnect: only BTC recovers on generation 2.
+        apply_price_update(&mut prices, &mut generation, &update("BTC-USDT", "105", 2));
+
+        assert_eq!(generation, 2);
+        assert_eq!(prices.len(), 1);
         assert!(prices.contains_key("BTC-USDT"));
         assert!(!prices.contains_key("ETH-USDT"));
-    }
-
-    #[test]
-    fn prune_lagging_prices_keeps_pairs_within_lag() {
-        let mut prices = HashMap::new();
-        let older = Instant::now() - Duration::from_secs(3);
-        let newer = Instant::now();
-        prices.insert("ETH-USDT".to_string(), (price("200"), older));
-        prices.insert("BTC-USDT".to_string(), (price("100"), newer));
-
-        assert!(!prune_lagging_prices(&mut prices, Duration::from_secs(10)));
-        assert_eq!(prices.len(), 2);
-    }
-
-    #[test]
-    fn pair_max_lag_secs_uses_update_interval_when_larger_than_ping_window() {
-        // 60s emission interval with default-ish 5s ping timeout → lag must be 60, not 10.
-        assert_eq!(pair_max_lag_secs(60, 5), 60);
-        assert_eq!(pair_max_lag_secs(1, 5), 10);
-        assert_eq!(pair_max_lag_secs(1, 0), 2);
-    }
-
-    #[test]
-    fn prune_lagging_prices_keeps_throttled_pairs_within_update_interval() {
-        let max_lag = Duration::from_secs(pair_max_lag_secs(60, 5));
-        let mut prices = HashMap::new();
-        let quieter = Instant::now() - Duration::from_secs(45);
-        let newer = Instant::now();
-        prices.insert("ETH-USDT".to_string(), (price("200"), quieter));
-        prices.insert("BTC-USDT".to_string(), (price("100"), newer));
-
-        assert!(!prune_lagging_prices(&mut prices, max_lag));
-        assert_eq!(prices.len(), 2);
     }
 }
