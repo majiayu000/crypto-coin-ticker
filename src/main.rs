@@ -17,7 +17,8 @@
 //! configuration options.
 //!
 //! ## Logging
-//! Set the `RUST_LOG` environment variable to control logging levels:
+//! Prefer `RUST_LOG` when set. Otherwise `debug_logging = true` in `config.toml`
+//! enables `okk=debug`; the default filter is `okk=info`.
 //! ```bash
 //! RUST_LOG=debug cargo run
 //! RUST_LOG=okk=debug cargo run
@@ -29,16 +30,15 @@ use tracing_subscriber::prelude::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize logging
+    // Load configuration before logging so debug_logging can set the default filter
+    let config = Config::from_optional_file("config.toml")?;
+
     let fmt = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
         .with_filter(tracing_subscriber::EnvFilter::new(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "okk=info".into()),
+            config.resolve_log_filter(),
         ));
     tracing_subscriber::registry().with(fmt).init();
-
-    // Load configuration
-    let config = Config::from_optional_file("config.toml")?;
 
     // Create bounded communication channel
     let (tx, rx) = sync_channel(config.max_buffer_size);

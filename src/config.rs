@@ -135,6 +135,22 @@ impl Config {
         }
     }
 
+    /// Resolve the tracing `EnvFilter` directive.
+    ///
+    /// Precedence: `RUST_LOG` wins when set; otherwise `debug_logging=true`
+    /// selects `okk=debug`, and the default is `okk=info`.
+    pub fn resolve_log_filter(&self) -> String {
+        Self::resolve_log_filter_with(std::env::var("RUST_LOG").ok(), self.debug_logging)
+    }
+
+    fn resolve_log_filter_with(rust_log: Option<String>, debug_logging: bool) -> String {
+        match rust_log {
+            Some(filter) => filter,
+            None if debug_logging => "okk=debug".into(),
+            None => "okk=info".into(),
+        }
+    }
+
     fn validate(&self) -> Result<()> {
         if self.update_interval_secs == 0 {
             return Err(TickerError::ConfigError(
@@ -227,6 +243,30 @@ debug_logging = false
             error
                 .to_string()
                 .contains("update_interval_secs must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn rust_log_overrides_debug_logging() {
+        assert_eq!(
+            Config::resolve_log_filter_with(Some("okk=trace".into()), true),
+            "okk=trace"
+        );
+        assert_eq!(
+            Config::resolve_log_filter_with(Some("warn".into()), false),
+            "warn"
+        );
+    }
+
+    #[test]
+    fn debug_logging_sets_okk_debug_when_rust_log_unset() {
+        assert_eq!(
+            Config::resolve_log_filter_with(None, true),
+            "okk=debug"
+        );
+        assert_eq!(
+            Config::resolve_log_filter_with(None, false),
+            "okk=info"
         );
     }
 }

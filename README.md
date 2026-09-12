@@ -109,14 +109,24 @@ cargo check
 
 ### Logging
 
-Set the `RUST_LOG` environment variable to control logging levels:
+Logging filter precedence:
+
+1. `RUST_LOG` wins when set
+2. Otherwise `debug_logging = true` in `config.toml` uses `okk=debug`
+3. Otherwise the default is `okk=info`
 
 ```bash
-# Debug logging
+# Debug logging via environment (overrides config)
 RUST_LOG=debug cargo run
 
-# App-specific logging
+# App-specific logging via environment
 RUST_LOG=okk=debug cargo run
+```
+
+Or enable debug logs from config when `RUST_LOG` is unset:
+
+```toml
+debug_logging = true
 ```
 
 ## License
