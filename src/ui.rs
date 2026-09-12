@@ -32,6 +32,17 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
 
+/// Stale-lag window for per-pair tray price expiry.
+///
+/// Must be at least `update_interval_secs` so throttled healthy pairs are not
+/// pruned when another pair emits first. Also keep the prior `2 * ping`
+/// floor so short partial-reconnect gaps still expire unrecovered pairs.
+pub(crate) fn pair_max_lag_secs(update_interval_secs: u64, ws_ping_timeout_secs: u64) -> u64 {
+    update_interval_secs
+        .max(ws_ping_timeout_secs.saturating_mul(2))
+        .max(2)
+}
+
 /// Drop pairs that lag the freshest update by more than `max_lag`.
 ///
 /// After a short outage with only some subscriptions confirmed, recovered pairs keep
@@ -134,9 +145,11 @@ impl TrayUI {
         let configured_pairs = self.config.trading_pairs.clone();
         // Per-pair timestamps let us expire unrecovered pairs after a partial reconnect.
         let mut latest_prices: HashMap<String, (Price, Instant)> = HashMap::new();
-        // Allow a pair to lag the freshest update by twice the ping timeout before expiry.
-        let pair_max_lag =
-            Duration::from_secs(self.config.ws_ping_timeout_secs.saturating_mul(2).max(2));
+        // Lag window covers both ping-timeout gaps and the configured emission interval.
+        let pair_max_lag = Duration::from_secs(pair_max_lag_secs(
+            self.config.update_interval_secs,
+            self.config.ws_ping_timeout_secs,
+        ));
 
         tracing::info!("Starting UI event loop");
 
@@ -345,6 +358,27 @@ mod tests {
         prices.insert("BTC-USDT".to_string(), (price("100"), newer));
 
         assert!(!prune_lagging_prices(&mut prices, Duration::from_secs(10)));
+        assert_eq!(prices.len(), 2);
+    }
+
+    #[test]
+    fn pair_max_lag_secs_uses_update_interval_when_larger_than_ping_window() {
+        // 60s emission interval with default-ish 5s ping timeout → lag must be 60, not 10.
+        assert_eq!(pair_max_lag_secs(60, 5), 60);
+        assert_eq!(pair_max_lag_secs(1, 5), 10);
+        assert_eq!(pair_max_lag_secs(1, 0), 2);
+    }
+
+    #[test]
+    fn prune_lagging_prices_keeps_throttled_pairs_within_update_interval() {
+        let max_lag = Duration::from_secs(pair_max_lag_secs(60, 5));
+        let mut prices = HashMap::new();
+        let quieter = Instant::now() - Duration::from_secs(45);
+        let newer = Instant::now();
+        prices.insert("ETH-USDT".to_string(), (price("200"), quieter));
+        prices.insert("BTC-USDT".to_string(), (price("100"), newer));
+
+        assert!(!prune_lagging_prices(&mut prices, max_lag));
         assert_eq!(prices.len(), 2);
     }
 }
