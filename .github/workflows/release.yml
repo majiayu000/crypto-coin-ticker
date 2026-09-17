@@ -1,0 +1,123 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    name: Signed macOS app
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require Apple signing secrets
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in \
+            APPLE_CERTIFICATE \
+            APPLE_CERTIFICATE_PASSWORD \
+            APPLE_SIGNING_IDENTITY \
+            APPLE_API_KEY \
+            APPLE_API_ISSUER \
+            APPLE_API_KEY_CONTENT
+          do
+            if [ -z "${!name}" ]; then
+              echo "Missing required secret: $name" >&2
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Import Developer ID certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          certificate_path="$RUNNER_TEMP/ticker-developer-id.p12"
+          keychain_path="$RUNNER_TEMP/ticker-signing.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+          echo "::add-mask::$keychain_password"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" -k "$keychain_path" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain_path"
+          security list-keychains -d user -s "$keychain_path" login.keychain-db
+          {
+            echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY"
+            echo "TICKER_SIGNING_KEYCHAIN=$keychain_path"
+            echo "TICKER_CERTIFICATE_PATH=$certificate_path"
+          } >> "$GITHUB_ENV"
+
+      - name: Write App Store Connect API key
+        env:
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          set -euo pipefail
+          api_key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s' "$APPLE_API_KEY_CONTENT" | base64 --decode > "$api_key_path"
+          chmod 600 "$api_key_path"
+          echo "APPLE_API_KEY_PATH=$api_key_path" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build and sign app
+        env:
+          TICKER_REQUIRE_DEVELOPER_ID: "1"
+        run: ./scripts/build-macos-app.sh
+
+      - name: Notarize
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          app="dist/CryptoTicker.app"
+          zip="$RUNNER_TEMP/CryptoTicker-notarize.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$zip"
+          xcrun notarytool submit "$zip" \
+            --key "$APPLE_API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait
+          xcrun stapler staple "$app"
+          xcrun stapler validate "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          spctl --assess --type execute --verbose=4 "$app"
+          ditto -c -k --sequesterRsrc --keepParent "$app" dist/CryptoTicker.zip
+          shasum -a 256 dist/CryptoTicker.zip > dist/CryptoTicker.zip.sha256
+
+      - name: Remove temporary signing material
+        if: always()
+        run: |
+          if [ -n "${TICKER_SIGNING_KEYCHAIN:-}" ]; then
+            security delete-keychain "$TICKER_SIGNING_KEYCHAIN" || true
+          fi
+          rm -f "${TICKER_CERTIFICATE_PATH:-}" "${APPLE_API_KEY_PATH:-}"
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/CryptoTicker.zip
+            dist/CryptoTicker.zip.sha256
+          generate_release_notes: true
