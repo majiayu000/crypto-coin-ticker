@@ -26,7 +26,10 @@ use crate::exchange::{Price, PriceUpdate};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
-use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tao::{
+    event::Event,
+    event_loop::{ControlFlow, EventLoopBuilder},
+};
 use tray_icon::{
     TrayIconBuilder, TrayIconEvent,
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
@@ -38,6 +41,31 @@ use tray_icon::{
 /// throttling cannot look like a dead connection when the interval is >30s.
 pub(crate) fn disconnect_silence_timeout(update_interval_secs: u64) -> Duration {
     Duration::from_secs(update_interval_secs.saturating_mul(2).max(30))
+}
+
+/// Idle scheduling for the tray event loop.
+///
+/// A disconnect deadline still in the future waits until that instant. Once
+/// `now` has reached it, wait for a real event instead: tao 0.34 treats a past
+/// `WaitUntil` as a repeating poll on macOS and a non-blocking resume on Linux.
+pub(crate) fn idle_control_flow(
+    last_price_update: Instant,
+    disconnect_after: Duration,
+    now: Instant,
+) -> ControlFlow {
+    let deadline = last_price_update + disconnect_after;
+    if now < deadline {
+        ControlFlow::WaitUntil(deadline)
+    } else {
+        ControlFlow::Wait
+    }
+}
+
+enum UserEvent {
+    Price(PriceUpdate),
+    PriceChannelClosed,
+    Menu(MenuEvent),
+    Tray(TrayIconEvent),
 }
 
 /// Apply a price update onto the per-pair cache, clearing on reconnect.
@@ -99,7 +127,7 @@ impl TrayUI {
             e
         })?;
 
-        let event_loop = EventLoopBuilder::new().build();
+        let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
 
         // Create tray menu with error handling
         let tray_menu = Menu::new();
@@ -126,9 +154,28 @@ impl TrayUI {
 
         tracing::info!("System tray initialized successfully");
 
-        // Setup event channels with error handling
-        let menu_channel = MenuEvent::receiver();
-        let tray_channel = TrayIconEvent::receiver();
+        // Handlers replace the tray-icon channels. Once set, those receivers stay empty.
+        let proxy = event_loop.create_proxy();
+        let menu_proxy = proxy.clone();
+        MenuEvent::set_event_handler(Some(move |event| {
+            let _ = menu_proxy.send_event(UserEvent::Menu(event));
+        }));
+        let tray_proxy = proxy.clone();
+        TrayIconEvent::set_event_handler(Some(move |event| {
+            let _ = tray_proxy.send_event(UserEvent::Tray(event));
+        }));
+
+        // The exchange keeps its bounded channel. This thread blocks on it and
+        // wakes the tao loop, which would otherwise sleep between ticks.
+        let price_proxy = proxy;
+        std::thread::spawn(move || {
+            while let Ok(update) = price_rx.recv() {
+                if price_proxy.send_event(UserEvent::Price(update)).is_err() {
+                    return;
+                }
+            }
+            let _ = price_proxy.send_event(UserEvent::PriceChannelClosed);
+        });
 
         let mut last_price_update = Instant::now();
         let mut connection_status = "Connected";
@@ -141,13 +188,9 @@ impl TrayUI {
 
         tracing::info!("Starting UI event loop");
 
-        // Run event loop with comprehensive event handling
-        event_loop.run(move |_event, _, control_flow| {
-            *control_flow = ControlFlow::Poll;
-
-            // Handle price updates with connection monitoring
-            match price_rx.try_recv() {
-                Ok(price_update) => {
+        event_loop.run(move |event, _, control_flow| {
+            match event {
+                Event::UserEvent(UserEvent::Price(price_update)) => {
                     last_price_update = Instant::now();
                     connection_status = "Connected";
 
@@ -159,42 +202,42 @@ impl TrayUI {
 
                     tracing::debug!("Updated tray with: {}", title);
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    // Advisory disconnect UI only. Cache expiry is generation-based via
-                    // apply_price_update so throttle gaps cannot drop quiet healthy pairs.
-                    if last_price_update.elapsed() > disconnect_after {
-                        if connection_status != "Disconnected" {
-                            connection_status = "Disconnected";
-                            if let Some(ref mut tray) = tray_icon {
-                                tray.set_title(Some("Disconnected"));
-                            }
-                            tracing::warn!("No price updates received for {:?}", disconnect_after);
-                        }
-                    }
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Event::UserEvent(UserEvent::PriceChannelClosed) => {
                     tracing::error!("Price update channel disconnected, shutting down UI");
                     tray_icon.take();
                     *control_flow = ControlFlow::Exit;
                     return;
                 }
-            }
-
-            // Handle menu events
-            if let Ok(event) = menu_channel.try_recv() {
-                tracing::debug!("Menu event received: {:?}", event.id);
-                if event.id == quit_item.id() {
-                    tracing::info!("Quit requested by user");
-                    tray_icon.take();
-                    *control_flow = ControlFlow::Exit;
+                Event::UserEvent(UserEvent::Menu(menu_event)) => {
+                    tracing::debug!("Menu event received: {:?}", menu_event.id);
+                    if menu_event.id == quit_item.id() {
+                        tracing::info!("Quit requested by user");
+                        tray_icon.take();
+                        *control_flow = ControlFlow::Exit;
+                        return;
+                    }
                 }
+                Event::UserEvent(UserEvent::Tray(tray_event)) => {
+                    tracing::debug!("Tray event received: {:?}", tray_event);
+                }
+                Event::MainEventsCleared => {
+                    // User events in this wake are delivered first, so a price that
+                    // arrived with the deadline has already refreshed last_price_update.
+                    // `>=` matches the instant idle_control_flow switches to Wait.
+                    if last_price_update.elapsed() >= disconnect_after
+                        && connection_status != "Disconnected"
+                    {
+                        connection_status = "Disconnected";
+                        if let Some(ref mut tray) = tray_icon {
+                            tray.set_title(Some("Disconnected"));
+                        }
+                        tracing::warn!("No price updates received for {:?}", disconnect_after);
+                    }
+                }
+                _ => {}
             }
 
-            // Handle tray events (clicks, etc.)
-            if let Ok(event) = tray_channel.try_recv() {
-                tracing::debug!("Tray event received: {:?}", event);
-                // Future: Handle tray click events for additional functionality
-            }
+            *control_flow = idle_control_flow(last_price_update, disconnect_after, Instant::now());
         })
     }
 
@@ -355,6 +398,38 @@ mod tests {
         assert_eq!(disconnect_silence_timeout(1), Duration::from_secs(30));
         assert_eq!(disconnect_silence_timeout(30), Duration::from_secs(60));
         assert_eq!(disconnect_silence_timeout(60), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn idle_control_flow_waits_until_a_future_disconnect_deadline() {
+        let last_price_update = Instant::now();
+        let disconnect_after = Duration::from_secs(30);
+        let now = last_price_update + Duration::from_secs(5);
+
+        assert_eq!(
+            idle_control_flow(last_price_update, disconnect_after, now),
+            ControlFlow::WaitUntil(last_price_update + disconnect_after)
+        );
+    }
+
+    #[test]
+    fn idle_control_flow_waits_when_deadline_is_due_or_past() {
+        let last_price_update = Instant::now();
+        let disconnect_after = Duration::from_secs(30);
+        let deadline = last_price_update + disconnect_after;
+
+        assert_eq!(
+            idle_control_flow(last_price_update, disconnect_after, deadline),
+            ControlFlow::Wait
+        );
+        assert_eq!(
+            idle_control_flow(
+                last_price_update,
+                disconnect_after,
+                deadline + Duration::from_nanos(1)
+            ),
+            ControlFlow::Wait
+        );
     }
 
     #[test]
