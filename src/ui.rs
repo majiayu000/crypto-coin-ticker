@@ -25,6 +25,7 @@ use crate::error::{Result, TickerError};
 use crate::exchange::{Price, PriceUpdate};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tao::{
     event::Event,
@@ -48,6 +49,11 @@ pub(crate) fn disconnect_silence_timeout(update_interval_secs: u64) -> Duration 
 /// A disconnect deadline still in the future waits until that instant. Once
 /// `now` has reached it, wait for a real event instead: tao 0.34 treats a past
 /// `WaitUntil` as a repeating poll on macOS and a non-blocking resume on Linux.
+///
+/// A future `WaitUntil` also never wakes tao 0.34 on Linux, because the gtk
+/// iteration has no timeout. The disconnect sleeper posts `DisconnectDeadline`
+/// for that case. Switching to `Wait` once the deadline is due still keeps a
+/// past `WaitUntil` from spinning.
 pub(crate) fn idle_control_flow(
     last_price_update: Instant,
     disconnect_after: Duration,
@@ -66,6 +72,101 @@ enum UserEvent {
     PriceChannelClosed,
     Menu(MenuEvent),
     Tray(TrayIconEvent),
+    /// The silence window elapsed. Wakes the tao loop; the one-shot title flip
+    /// stays on `MainEventsCleared` so a price queued in the same wake is applied first.
+    DisconnectDeadline,
+}
+
+/// Latest silence deadline shared with the single disconnect sleeper.
+///
+/// `generation` advances only when the deadline changes, so the sleeper posts
+/// one event per price time and then waits to be re-armed.
+struct DisconnectDeadlineArm {
+    state: Mutex<DisconnectDeadlineState>,
+    wake: Condvar,
+}
+
+struct DisconnectDeadlineState {
+    deadline: Instant,
+    generation: u64,
+}
+
+impl DisconnectDeadlineArm {
+    fn new(deadline: Instant) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(DisconnectDeadlineState {
+                deadline,
+                generation: 1,
+            }),
+            wake: Condvar::new(),
+        })
+    }
+
+    /// Point the sleeper at `deadline`. The same deadline leaves it alone.
+    fn rearm(&self, deadline: Instant) {
+        let mut state = lock_deadline(&self.state);
+        if state.deadline == deadline {
+            return;
+        }
+        state.deadline = deadline;
+        state.generation = state.generation.wrapping_add(1);
+        self.wake.notify_one();
+    }
+}
+
+fn lock_deadline(
+    state: &Mutex<DisconnectDeadlineState>,
+) -> std::sync::MutexGuard<'_, DisconnectDeadlineState> {
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Sleep until the current deadline, then call `fire` once.
+///
+/// A later [`DisconnectDeadlineArm::rearm`] abandons the old wait. `fire`
+/// returns false when the event loop is gone and the sleeper should exit.
+fn spawn_disconnect_sleeper(
+    arm: Arc<DisconnectDeadlineArm>,
+    mut fire: impl FnMut() -> bool + Send + 'static,
+) {
+    std::thread::spawn(move || {
+        let mut handled_generation = 0_u64;
+        loop {
+            let (deadline, generation) = {
+                let mut state = lock_deadline(&arm.state);
+                while state.generation == handled_generation {
+                    state = arm
+                        .wake
+                        .wait(state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+                (state.deadline, state.generation)
+            };
+
+            loop {
+                let state = lock_deadline(&arm.state);
+                if state.generation != generation {
+                    break;
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    drop(state);
+                    if !fire() {
+                        return;
+                    }
+                    handled_generation = generation;
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                let (state, _) = arm
+                    .wake
+                    .wait_timeout(state, remaining)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                drop(state);
+            }
+        }
+    });
 }
 
 /// Apply a price update onto the per-pair cache, clearing on reconnect.
@@ -166,8 +267,9 @@ impl TrayUI {
         }));
 
         // The exchange keeps its bounded channel. This thread blocks on it and
-        // wakes the tao loop, which would otherwise sleep between ticks.
-        let price_proxy = proxy;
+        // forwards each accepted PriceUpdate, which wakes the tao loop between ticks.
+        // should_emit_update and try_send already drop ticks before they get here.
+        let price_proxy = proxy.clone();
         std::thread::spawn(move || {
             while let Ok(update) = price_rx.recv() {
                 if price_proxy.send_event(UserEvent::Price(update)).is_err() {
@@ -186,6 +288,14 @@ impl TrayUI {
         let mut latest_prices: HashMap<String, Price> = HashMap::new();
         let mut price_generation = 0_u64;
 
+        // One sleeper, re-armed only when last_price_update changes. tao 0.34 on
+        // Linux never wakes a future WaitUntil, so this post is what lets
+        // MainEventsCleared flip the title to Disconnected.
+        let deadline_arm = DisconnectDeadlineArm::new(last_price_update + disconnect_after);
+        spawn_disconnect_sleeper(Arc::clone(&deadline_arm), move || {
+            proxy.send_event(UserEvent::DisconnectDeadline).is_ok()
+        });
+
         tracing::info!("Starting UI event loop");
 
         event_loop.run(move |event, _, control_flow| {
@@ -193,6 +303,7 @@ impl TrayUI {
                 Event::UserEvent(UserEvent::Price(price_update)) => {
                     last_price_update = Instant::now();
                     connection_status = "Connected";
+                    deadline_arm.rearm(last_price_update + disconnect_after);
 
                     apply_price_update(&mut latest_prices, &mut price_generation, &price_update);
                     let title = format_combined_title(&configured_pairs, &latest_prices);
@@ -219,6 +330,11 @@ impl TrayUI {
                 }
                 Event::UserEvent(UserEvent::Tray(tray_event)) => {
                     tracing::debug!("Tray event received: {:?}", tray_event);
+                }
+                Event::UserEvent(UserEvent::DisconnectDeadline) => {
+                    // The sleeper only posts this once the deadline is due. The
+                    // one-shot title stays in MainEventsCleared, which runs after
+                    // every user event already queued for this wake.
                 }
                 Event::MainEventsCleared => {
                     // User events in this wake are delivered first, so a price that
@@ -448,5 +564,29 @@ mod tests {
             format_combined_title(&["BTC-USDT".into(), "ETH-USDT".into()], &prices),
             "BTC-USDT: $101.00 | ETH-USDT: $200.00"
         );
+    }
+
+    #[test]
+    fn disconnect_sleeper_fires_once_per_deadline_and_rearms() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let arm = DisconnectDeadlineArm::new(started + Duration::from_secs(5));
+        spawn_disconnect_sleeper(std::sync::Arc::clone(&arm), move || tx.send(()).is_ok());
+
+        arm.rearm(Instant::now() + Duration::from_millis(40));
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("rearmed deadline wakes the sleeper");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "sleeper kept the replaced 5s deadline"
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_millis(80)).is_err(),
+            "one deadline must not wake the loop twice"
+        );
+
+        arm.rearm(Instant::now() + Duration::from_millis(40));
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("a new price time arms another wake");
     }
 }
