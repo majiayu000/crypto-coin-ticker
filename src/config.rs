@@ -37,7 +37,10 @@
 
 use crate::error::{Result, TickerError};
 use serde::{Deserialize, Serialize};
-use std::{io::ErrorKind, path::Path};
+use std::{
+    io::ErrorKind,
+    path::{Path, PathBuf},
+};
 
 /// Default maximum buffer size for price updates
 fn default_max_buffer_size() -> usize {
@@ -115,6 +118,23 @@ impl Config {
         }
     }
 
+    /// Load config from the working directory, then beside the executable.
+    pub fn from_startup() -> Result<Self> {
+        match std::fs::metadata("config.toml") {
+            Ok(_) => Self::from_file("config.toml"),
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                let executable = std::env::current_exe().map_err(|e| {
+                    TickerError::ConfigError(format!("Failed to locate executable: {}", e))
+                })?;
+                Self::from_optional_file(executable.with_file_name("config.toml"))
+            }
+            Err(e) => Err(TickerError::ConfigError(format!(
+                "Failed to inspect config file: {}",
+                e
+            ))),
+        }
+    }
+
     /// Save configuration to a TOML file
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let content = toml::to_string_pretty(self)
@@ -126,13 +146,26 @@ impl Config {
         Ok(())
     }
 
-    /// Get the full icon path
-    pub fn get_icon_path(&self) -> String {
-        if self.icon_path.starts_with('/') {
-            self.icon_path.clone()
-        } else {
-            format!("{}/{}", env!("CARGO_MANIFEST_DIR"), self.icon_path)
+    /// Resolve the default bundled icon, absolute overrides, or source-tree paths.
+    pub fn get_icon_path(&self) -> Result<PathBuf> {
+        let icon_path = Path::new(&self.icon_path);
+        if icon_path.is_absolute() {
+            return Ok(icon_path.to_path_buf());
         }
+
+        if icon_path == Path::new("icons/icon.png") {
+            let executable = std::env::current_exe()
+                .map_err(|e| TickerError::UIError(format!("Failed to locate executable: {}", e)))?;
+            if let Some(contents) = executable
+                .parent()
+                .filter(|parent| parent.ends_with("Contents/MacOS"))
+                .and_then(Path::parent)
+            {
+                return Ok(contents.join("Resources/icon.png"));
+            }
+        }
+
+        Ok(Path::new(env!("CARGO_MANIFEST_DIR")).join(icon_path))
     }
 
     fn validate(&self) -> Result<()> {

@@ -359,8 +359,8 @@ impl TrayUI {
 
     /// Load the tray icon from the configured path
     fn load_icon(&self) -> Result<tray_icon::Icon> {
-        let icon_path = self.config.get_icon_path();
-        let path = std::path::Path::new(&icon_path);
+        let icon_path = self.config.get_icon_path()?;
+        let path = &icon_path;
 
         let (icon_rgba, icon_width, icon_height) = {
             let image = image::open(path)
@@ -379,6 +379,153 @@ impl TrayUI {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_relocated_test(test_name: &str) {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!(
+                "relocated-{}-{}",
+                test_name.rsplit("::").next().unwrap(),
+                std::process::id()
+            ));
+        let contents = root.join("CryptoTicker.app/Contents");
+        std::fs::create_dir_all(contents.join("MacOS")).expect("bundle executable directory");
+        std::fs::create_dir_all(contents.join("Resources")).expect("bundle resources directory");
+        std::fs::create_dir_all(root.join("working-directory"))
+            .expect("unrelated working directory");
+        let executable = contents.join("MacOS/CryptoTicker");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).expect("relocated executable");
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("icons/icon.png"),
+            contents.join("Resources/icon.png"),
+        )
+        .expect("bundled icon");
+        let config = Config {
+            tooltip: "Relocated config".into(),
+            ..Config::default()
+        };
+        config
+            .save_to_file(contents.join("MacOS/config.toml"))
+            .expect("adjacent config");
+        let output = std::process::Command::new(executable)
+            .args(["--exact", test_name, "--nocapture"])
+            .env("TICKER_TEST_RELOCATED_BUNDLE", "1")
+            .current_dir(root.join("working-directory"))
+            .output()
+            .expect("run relocated executable");
+        std::fs::remove_dir_all(root).expect("remove test bundle");
+        assert!(
+            output.status.success(),
+            "relocated executable failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn relocated_bundle_loads_icon() {
+        if std::env::var_os("TICKER_TEST_RELOCATED_BUNDLE").is_some() {
+            let config = Config::default();
+            TrayUI::new(config.clone())
+                .load_icon()
+                .expect("relocated bundle should load its own icon");
+            let executable = std::env::current_exe().expect("test executable path");
+            let contents = executable.parent().unwrap().parent().unwrap();
+            assert_eq!(
+                config.get_icon_path().expect("icon path"),
+                contents.join("Resources/icon.png")
+            );
+            return;
+        }
+        run_relocated_test("ui::tests::relocated_bundle_loads_icon");
+    }
+
+    #[test]
+    fn relocated_binary_loads_adjacent_config() {
+        if std::env::var_os("TICKER_TEST_RELOCATED_BUNDLE").is_some() {
+            let config = Config::from_startup().expect("startup config");
+            assert_eq!(config.tooltip, "Relocated config");
+            return;
+        }
+        run_relocated_test("ui::tests::relocated_binary_loads_adjacent_config");
+    }
+
+    #[test]
+    fn relocated_config_preserves_precedence_and_errors() {
+        if std::env::var_os("TICKER_TEST_RELOCATED_BUNDLE").is_some() {
+            let config = Config {
+                tooltip: "Working directory config".into(),
+                ..Config::default()
+            };
+            config.save_to_file("config.toml").unwrap();
+            assert_eq!(Config::from_startup().unwrap().tooltip, config.tooltip);
+            std::fs::write("config.toml", "trading_pairs = [").unwrap();
+            assert!(matches!(
+                Config::from_startup(),
+                Err(TickerError::ConfigError(_))
+            ));
+            std::fs::remove_file("config.toml").unwrap();
+            let adjacent = std::env::current_exe()
+                .unwrap()
+                .with_file_name("config.toml");
+            std::fs::write(&adjacent, "trading_pairs = [").unwrap();
+            assert!(matches!(
+                Config::from_startup(),
+                Err(TickerError::ConfigError(_))
+            ));
+            std::fs::remove_file(adjacent).unwrap();
+            assert_eq!(Config::from_startup().unwrap(), Config::default());
+            return;
+        }
+        run_relocated_test("ui::tests::relocated_config_preserves_precedence_and_errors");
+    }
+
+    #[test]
+    fn relocated_icon_preserves_overrides_and_errors() {
+        if std::env::var_os("TICKER_TEST_RELOCATED_BUNDLE").is_some() {
+            let executable = std::env::current_exe().unwrap();
+            let resources = executable
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("Resources");
+            let custom_icon = resources.join("custom.png");
+            std::fs::copy(resources.join("icon.png"), &custom_icon).unwrap();
+            let config = Config {
+                icon_path: custom_icon.to_str().unwrap().into(),
+                ..Config::default()
+            };
+            assert_eq!(config.get_icon_path().unwrap(), custom_icon);
+            TrayUI::new(config)
+                .load_icon()
+                .expect("absolute icon override");
+            std::fs::remove_file(resources.join("icon.png")).unwrap();
+            assert!(matches!(
+                TrayUI::new(Config::default()).load_icon(),
+                Err(TickerError::UIError(_))
+            ));
+            std::fs::write(resources.join("icon.png"), b"invalid image").unwrap();
+            assert!(matches!(
+                TrayUI::new(Config::default()).load_icon(),
+                Err(TickerError::UIError(_))
+            ));
+            return;
+        }
+        run_relocated_test("ui::tests::relocated_icon_preserves_overrides_and_errors");
+    }
+
+    #[test]
+    fn source_checkout_loads_icon() {
+        let config = Config::default();
+        assert_eq!(
+            config.get_icon_path().unwrap(),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("icons/icon.png")
+        );
+        TrayUI::new(config)
+            .load_icon()
+            .expect("source checkout icon");
+    }
 
     fn price(raw: &str) -> Price {
         Price::parse(raw).expect("valid price")

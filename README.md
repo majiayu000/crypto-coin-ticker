@@ -53,7 +53,9 @@ max_buffer_size = 1000
 debug_logging = false
 ```
 
-See `config.toml.example` for all available options.
+See `config.toml.example` for all available options. Startup checks the working directory first, then looks for `config.toml` beside the executable (`CryptoTicker.app/Contents/MacOS/config.toml` for the macOS bundle). Missing files use defaults; invalid files return an error.
+
+The macOS bundle loads the default tray icon from `Contents/Resources/icon.png`. Absolute `icon_path` overrides are supported; other relative icon paths resolve against the source checkout.
 
 ## Release Status
 

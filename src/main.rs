@@ -12,8 +12,8 @@
 //! 5. Launch system tray UI and enter event loop
 //!
 //! ## Configuration
-//! The application looks for a `config.toml` file in the current directory.
-//! If not found, it uses sensible defaults. See `config.toml.example` for
+//! The application looks for `config.toml` in the current directory, then beside
+//! the executable. If neither exists, it uses defaults. See `config.toml.example` for
 //! configuration options.
 //!
 //! ## Logging
@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry().with(fmt).init();
 
     // Load configuration
-    let config = Config::from_optional_file("config.toml")?;
+    let config = Config::from_startup()?;
 
     // Create bounded communication channel
     let (tx, rx) = sync_channel(config.max_buffer_size);
