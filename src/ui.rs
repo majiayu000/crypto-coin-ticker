@@ -400,16 +400,20 @@ mod tests {
             contents.join("Resources/icon.png"),
         )
         .expect("bundled icon");
+        let user_home = root.join("user-home");
+        let config_directory = user_home.join("Library/Application Support/CryptoTicker");
+        std::fs::create_dir_all(&config_directory).expect("user config directory");
         let config = Config {
-            tooltip: "Relocated config".into(),
+            tooltip: "User config".into(),
             ..Config::default()
         };
         config
-            .save_to_file(contents.join("MacOS/config.toml"))
-            .expect("adjacent config");
+            .save_to_file(config_directory.join("config.toml"))
+            .expect("user config outside bundle");
         let output = std::process::Command::new(executable)
             .args(["--exact", test_name, "--nocapture"])
             .env("TICKER_TEST_RELOCATED_BUNDLE", "1")
+            .env("HOME", &user_home)
             .current_dir(root.join("working-directory"))
             .output()
             .expect("run relocated executable");
@@ -440,16 +444,26 @@ mod tests {
         run_relocated_test("ui::tests::relocated_bundle_loads_icon");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn relocated_binary_loads_adjacent_config() {
+    fn relocated_bundle_loads_user_config() {
         if std::env::var_os("TICKER_TEST_RELOCATED_BUNDLE").is_some() {
             let config = Config::from_startup().expect("startup config");
-            assert_eq!(config.tooltip, "Relocated config");
+            assert_eq!(config.tooltip, "User config");
+            TrayUI::new(config).load_icon().expect("bundled icon");
+            assert!(
+                !std::env::current_exe()
+                    .unwrap()
+                    .with_file_name("config.toml")
+                    .exists(),
+                "user config must stay outside the bundle"
+            );
             return;
         }
-        run_relocated_test("ui::tests::relocated_binary_loads_adjacent_config");
+        run_relocated_test("ui::tests::relocated_bundle_loads_user_config");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn relocated_config_preserves_precedence_and_errors() {
         if std::env::var_os("TICKER_TEST_RELOCATED_BUNDLE").is_some() {
@@ -465,15 +479,19 @@ mod tests {
                 Err(TickerError::ConfigError(_))
             ));
             std::fs::remove_file("config.toml").unwrap();
-            let adjacent = std::env::current_exe()
-                .unwrap()
-                .with_file_name("config.toml");
-            std::fs::write(&adjacent, "trading_pairs = [").unwrap();
+            let user_config = std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
+                .join("Library/Application Support/CryptoTicker/config.toml");
+            std::fs::write(&user_config, "trading_pairs = [").unwrap();
             assert!(matches!(
                 Config::from_startup(),
                 Err(TickerError::ConfigError(_))
             ));
-            std::fs::remove_file(adjacent).unwrap();
+            std::fs::remove_file(&user_config).unwrap();
+            std::fs::create_dir(&user_config).unwrap();
+            let error = Config::from_startup().expect_err("unreadable user config must fail");
+            assert!(matches!(error, TickerError::ConfigError(_)));
+            assert!(error.to_string().contains("Failed to read config file"));
+            std::fs::remove_dir(&user_config).unwrap();
             assert_eq!(Config::from_startup().unwrap(), Config::default());
             return;
         }

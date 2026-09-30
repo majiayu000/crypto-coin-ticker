@@ -12,9 +12,9 @@
 //! 5. Launch system tray UI and enter event loop
 //!
 //! ## Configuration
-//! The application looks for `config.toml` in the current directory, then beside
-//! the executable. If neither exists, it uses defaults. See `config.toml.example` for
-//! configuration options.
+//! The application looks for `config.toml` in the current directory, then in
+//! `~/Library/Application Support/CryptoTicker/` on macOS. If no config exists, it
+//! uses defaults. See `config.toml.example` for configuration options.
 //!
 //! ## Logging
 //! Set the `RUST_LOG` environment variable to control logging levels:

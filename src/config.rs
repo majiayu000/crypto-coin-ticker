@@ -118,15 +118,24 @@ impl Config {
         }
     }
 
-    /// Load config from the working directory, then beside the executable.
+    /// Load config from the working directory, then macOS Application Support.
     pub fn from_startup() -> Result<Self> {
         match std::fs::metadata("config.toml") {
             Ok(_) => Self::from_file("config.toml"),
             Err(e) if e.kind() == ErrorKind::NotFound => {
-                let executable = std::env::current_exe().map_err(|e| {
-                    TickerError::ConfigError(format!("Failed to locate executable: {}", e))
-                })?;
-                Self::from_optional_file(executable.with_file_name("config.toml"))
+                #[cfg(target_os = "macos")]
+                {
+                    let home = std::env::home_dir().ok_or_else(|| {
+                        TickerError::ConfigError("Failed to locate user home directory".into())
+                    })?;
+                    Self::from_optional_file(
+                        home.join("Library/Application Support/CryptoTicker/config.toml"),
+                    )
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    Ok(Self::default())
+                }
             }
             Err(e) => Err(TickerError::ConfigError(format!(
                 "Failed to inspect config file: {}",
