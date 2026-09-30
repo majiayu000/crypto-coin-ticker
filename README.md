@@ -1,10 +1,14 @@
 # Crypto Coin Ticker
 
-A lightweight, cross-platform system tray application for monitoring cryptocurrency prices in real-time. Built with Rust for performance and reliability.
+A Rust system tray application for monitoring OKX cryptocurrency prices over its public WebSocket API.
+
+[Build from source](#installation) · [Configuration](#configuration) · [Supported exchanges](#supported-exchanges)
+
+The project is currently source-only; no packaged release is available.
 
 ## Features
 
-- **Real-time Price Updates**: Live cryptocurrency price streaming from major exchanges
+- **Real-time Price Updates**: Live cryptocurrency price streaming from OKX
 - **System Tray Integration**: Clean, unobtrusive system tray interface
 - **Multi-pair Support**: Monitor multiple trading pairs simultaneously
 - **Configurable**: TOML-based configuration with sensible defaults
@@ -19,7 +23,7 @@ A lightweight, cross-platform system tray application for monitoring cryptocurre
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/crypto-coin-ticker.git
+git clone https://github.com/majiayu000/crypto-coin-ticker.git
 cd crypto-coin-ticker
 
 # Build the application
@@ -53,7 +57,7 @@ max_buffer_size = 1000
 debug_logging = false
 ```
 
-See `config.toml.example` for all available options.
+See [`config.toml.example`](config.toml.example) for all available options.
 
 ## Release Status
 
