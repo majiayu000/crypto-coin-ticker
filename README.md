@@ -2,7 +2,7 @@
 
 A Rust system tray application for monitoring OKX cryptocurrency prices over its public WebSocket API.
 
-[Build from source](#installation) · [Configuration](#configuration) · [Supported exchanges](#supported-exchanges)
+[Build from source](#installation) · [OKX setup and troubleshooting](docs/okx-ticker-setup.md) · [Configuration](#configuration) · [Supported exchanges](#supported-exchanges)
 
 The project is currently source-only; no packaged release is available.
 
