@@ -57,7 +57,16 @@ max_buffer_size = 1000
 debug_logging = false
 ```
 
-See [`config.toml.example`](config.toml.example) for all available options.
+See [`config.toml.example`](config.toml.example) for all available options. Startup checks the working directory first, then `~/Library/Application Support/CryptoTicker/config.toml` on macOS. If no config exists, it uses defaults; invalid or unreadable files return an error.
+
+To customize the macOS app, copy the example from a source checkout to the user configuration directory outside the signed app bundle:
+
+```bash
+mkdir -p "$HOME/Library/Application Support/CryptoTicker"
+cp config.toml.example "$HOME/Library/Application Support/CryptoTicker/config.toml"
+```
+
+The macOS bundle loads the default tray icon from `Contents/Resources/icon.png`. Absolute `icon_path` overrides are supported; other relative icon paths resolve against the source checkout.
 
 ## Release Status
 
