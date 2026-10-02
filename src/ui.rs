@@ -381,13 +381,11 @@ mod tests {
     use super::*;
 
     fn run_relocated_test(test_name: &str) {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(format!(
-                "relocated-{}-{}",
-                test_name.rsplit("::").next().unwrap(),
-                std::process::id()
-            ));
+        let root = std::env::temp_dir().join(format!(
+            "relocated-{}-{}",
+            test_name.rsplit("::").next().unwrap(),
+            std::process::id()
+        ));
         let contents = root.join("CryptoTicker.app/Contents");
         std::fs::create_dir_all(contents.join("MacOS")).expect("bundle executable directory");
         std::fs::create_dir_all(contents.join("Resources")).expect("bundle resources directory");
@@ -478,6 +476,24 @@ mod tests {
                 Config::from_startup(),
                 Err(TickerError::ConfigError(_))
             ));
+            std::fs::remove_file("config.toml").unwrap();
+            std::fs::create_dir("config.toml").unwrap();
+            let error = Config::from_startup().expect_err("unreadable working config must fail");
+            assert!(matches!(error, TickerError::ConfigError(_)));
+            assert!(error.to_string().contains("Failed to read config file"));
+            std::fs::remove_dir("config.toml").unwrap();
+            let invalid_config = Config {
+                update_interval_secs: 0,
+                ..Config::default()
+            };
+            invalid_config.save_to_file("config.toml").unwrap();
+            let error = Config::from_startup().expect_err("invalid working config must fail");
+            assert!(matches!(error, TickerError::ConfigError(_)));
+            assert!(
+                error
+                    .to_string()
+                    .contains("update_interval_secs must be greater than zero")
+            );
             std::fs::remove_file("config.toml").unwrap();
             let user_config = std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
                 .join("Library/Application Support/CryptoTicker/config.toml");
